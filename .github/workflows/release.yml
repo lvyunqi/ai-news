@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(awk -F ' *= *' '/^version = / { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)
+          test "${GITHUB_REF_NAME#v}" = "$cargo_version"
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+
+  windows-x64:
+    needs: quality
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      ASSET: qimen_dynamic_plugin_ai_news-x86_64-pc-windows-msvc.dll
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ env.TARGET }}
+      - run: cargo build --locked --release --target $env:TARGET
+      - name: Package asset and metadata
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $source = "target/$env:TARGET/release/qimen_dynamic_plugin_ai_news.dll"
+          $asset = "dist/$env:ASSET"
+          Copy-Item -LiteralPath $source -Destination $asset
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item -LiteralPath $asset).Length
+          "$hash  $env:ASSET" | Set-Content -LiteralPath "$asset.sha256" -Encoding ascii
+          [ordered]@{
+            target = $env:TARGET
+            asset_name = $env:ASSET
+            size_bytes = $size
+            sha256 = $hash
+            min_glibc = $null
+          } | ConvertTo-Json | Set-Content -LiteralPath "$asset.json" -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    container: debian:11
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET: libqimen_dynamic_plugin_ai_news-${{ matrix.target }}.so
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates build-essential curl binutils file
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ env.TARGET }}
+      - run: cargo build --locked --release --target "$TARGET"
+      - name: Package asset and inspect glibc
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          source="target/$TARGET/release/libqimen_dynamic_plugin_ai_news.so"
+          asset="dist/$ASSET"
+          cp "$source" "$asset"
+          sha256=$(sha256sum "$asset" | cut -d ' ' -f 1)
+          size=$(stat -c '%s' "$asset")
+          min_glibc=$(readelf --version-info "$asset" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -n 1 | sed 's/^GLIBC_//')
+          printf '%s  %s\n' "$sha256" "$ASSET" > "$asset.sha256"
+          printf '{\n  "target": "%s",\n  "asset_name": "%s",\n  "size_bytes": %s,\n  "sha256": "%s",\n  "min_glibc": "%s"\n}\n' \
+            "$TARGET" "$ASSET" "$size" "$sha256" "$min_glibc" > "$asset.json"
+          file "$asset"
+          ldd "$asset"
+          readelf --version-info "$asset" > "$asset.readelf.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [windows-x64, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify packaged hashes
+        shell: bash
+        working-directory: release-assets
+        run: sha256sum --check *.sha256
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release-assets/*.dll
+            release-assets/*.so
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: release-assets/*

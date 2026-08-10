@@ -108,6 +108,7 @@ Host API 返回 `Accepted` 只表示 QimenBot 宿主已接收入队，不代表�
 ```
 
 命令只读取内存快照，不访问 RSS、不下载图片、不发送测试消息。输出包括插件/API/配置版本、worker 状态、目标数量、最近轮询耗时、期号 ID 哈希前缀和最多 8 个目标的最近入队状态。
+每个目标结果同时包含脱敏账号、脱敏群标识、Host API 状态和本轮记录时间。
 
 ## 构建
 
@@ -127,6 +128,20 @@ cargo build --locked --release
 | Linux ARM64 GNU | `aarch64-unknown-linux-gnu` | `target/release/libqimen_dynamic_plugin_ai_news.so` |
 
 将动态库复制到 QimenBot `plugin_bin_dir`，默认是 `plugins/bin/`，然后在 Web 插件页点击重新扫描。动态库必须匹配宿主操作系统、CPU 和 C 运行时；musl 宿主不支持动态加载。
+
+## 候选版本发布
+
+推送与 `Cargo.toml` 版本一致的 `v*` tag 会触发 Release 工作流。工作流先执行格式、Clippy 和全部测试，再构建以下固定资产：
+
+- `qimen_dynamic_plugin_ai_news-x86_64-pc-windows-msvc.dll`
+- `libqimen_dynamic_plugin_ai_news-x86_64-unknown-linux-gnu.so`
+- `libqimen_dynamic_plugin_ai_news-aarch64-unknown-linux-gnu.so`
+
+每个动态库同时生成 `.sha256` 和 `.json` 元数据。Linux 在 Debian 11 容器中原生构建，并把 `file`、`ldd`、`readelf --version-info` 结果及实际最高 GLIBC 符号版本写入发布资产。发布前必须先完成目标 QimenBot 宿主加载和真实机器人能力确认；工作流配置完成不等于协议已经验收。
+
+## 依赖策略
+
+Dependabot 每周检查 Cargo 依赖和 GitHub Actions。依赖升级仍必须通过格式、Clippy、全部测试和 release 构建；发布前额外检查 RustSec 公告及新增依赖许可证。项目接受 Apache-2.0、MIT、BSD、ISC、Unicode、Zlib 等常见兼容许可证；GPL/AGPL、未知许可证、私有 registry、本地 path 和浮动 Git 分支需要维护者明确审查，不能自动合并。
 
 ## 状态文件
 

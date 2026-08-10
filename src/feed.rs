@@ -40,10 +40,20 @@ struct HttpResponse {
 
 pub struct HttpContentSource {
     client: reqwest::blocking::Client,
+    allow_http: bool,
 }
 
 impl HttpContentSource {
     pub fn new(timeout: std::time::Duration) -> Result<Self, String> {
+        Self::build(timeout, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(timeout: std::time::Duration) -> Result<Self, String> {
+        Self::build(timeout, true)
+    }
+
+    fn build(timeout: std::time::Duration, allow_http: bool) -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(timeout)
             .timeout(timeout)
@@ -51,7 +61,18 @@ impl HttpContentSource {
             .user_agent(concat!("qimen-ai-news/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| format!("创建 HTTP 客户端失败：{error}"))?;
-        Ok(Self { client })
+        Ok(Self { client, allow_http })
+    }
+
+    fn validate_request_url(&self, url: &Url, require_public: bool) -> Result<(), String> {
+        let scheme_allowed = url.scheme() == "https" || (self.allow_http && url.scheme() == "http");
+        if !scheme_allowed {
+            return Err("请求 URL 必须使用 HTTPS".to_string());
+        }
+        if require_public && !crate::render::is_public_https_url(url.as_str()) {
+            return Err("请求 URL 不是允许的公网 HTTPS 地址".to_string());
+        }
+        Ok(())
     }
 
     fn fetch_bytes(
@@ -61,12 +82,7 @@ impl HttpContentSource {
         max_redirects: usize,
         require_public: bool,
     ) -> Result<HttpResponse, String> {
-        if url.scheme() != "https" {
-            return Err("请求 URL 必须使用 HTTPS".to_string());
-        }
-        if require_public && !crate::render::is_public_https_url(url.as_str()) {
-            return Err("请求 URL 不是允许的公网 HTTPS 地址".to_string());
-        }
+        self.validate_request_url(url, require_public)?;
         let response = self
             .client
             .get(url.clone())
@@ -221,6 +237,11 @@ fn derive_markdown_url(page_url: &str, feed_url: &Url, date: NaiveDate) -> Optio
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
+    use tiny_http::{Header, Response, Server, StatusCode};
+
     use super::*;
 
     const RSS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -363,5 +384,90 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("RSS XML 解析失败"));
+    }
+
+    #[test]
+    fn http_fixture_redirect_loop_stops_at_limit() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/loop", server.server_addr())).unwrap();
+        let handle = thread::spawn(move || {
+            for _ in 0..6 {
+                let request = server.recv().unwrap();
+                let location = Header::from_bytes("Location", "/loop").unwrap();
+                request
+                    .respond(Response::empty(StatusCode(302)).with_header(location))
+                    .unwrap();
+            }
+        });
+        let source = HttpContentSource::new_for_tests(Duration::from_secs(2)).unwrap();
+
+        let error = source.fetch_markdown(&url).unwrap_err();
+
+        assert!(error.contains("重定向次数超过限制"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn http_fixture_revalidates_redirect_scheme() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/redirect", server.server_addr())).unwrap();
+        let handle = thread::spawn(move || {
+            let request = server.recv().unwrap();
+            let location = Header::from_bytes("Location", "file:///tmp/secret").unwrap();
+            request
+                .respond(Response::empty(StatusCode(302)).with_header(location))
+                .unwrap();
+        });
+        let source = HttpContentSource::new_for_tests(Duration::from_secs(2)).unwrap();
+
+        let error = source.fetch_markdown(&url).unwrap_err();
+
+        assert!(error.contains("必须使用 HTTPS"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn http_fixture_enforces_markdown_body_limit() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/large", server.server_addr())).unwrap();
+        let handle = thread::spawn(move || {
+            let request = server.recv().unwrap();
+            request
+                .respond(Response::from_data(vec![b'x'; MAX_MARKDOWN_BYTES + 1]))
+                .unwrap();
+        });
+        let source = HttpContentSource::new_for_tests(Duration::from_secs(2)).unwrap();
+
+        let error = source.fetch_markdown(&url).unwrap_err();
+
+        assert!(error.contains("响应体超过"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn http_fixture_enforces_total_timeout() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/slow", server.server_addr())).unwrap();
+        let handle = thread::spawn(move || {
+            let request = server.recv().unwrap();
+            thread::sleep(Duration::from_millis(250));
+            let _ = request.respond(Response::from_string("late"));
+        });
+        let source = HttpContentSource::new_for_tests(Duration::from_millis(50)).unwrap();
+
+        let error = source.fetch_markdown(&url).unwrap_err();
+
+        assert!(error.contains("请求失败") || error.contains("读取响应失败"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn redirect_target_public_check_rejects_private_https_address() {
+        let source = HttpContentSource::new_for_tests(Duration::from_secs(1)).unwrap();
+        let private = Url::parse("https://127.0.0.1/cover.png").unwrap();
+
+        let error = source.validate_request_url(&private, true).unwrap_err();
+
+        assert!(error.contains("公网 HTTPS"));
     }
 }

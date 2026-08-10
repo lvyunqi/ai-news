@@ -58,6 +58,7 @@ pub struct TargetResult {
     pub account_id: String,
     pub group_id: String,
     pub status: String,
+    pub at: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -247,7 +248,7 @@ fn run_poll(
         let key = target.key();
         if state.contains(&key, &issue.id) {
             result.skipped += 1;
-            result.targets.push(target_result(target, "Skipped"));
+            result.targets.push(target_result(target, "Skipped", now));
             continue;
         }
 
@@ -277,14 +278,17 @@ fn run_poll(
         let status_text = status_name(status);
         result
             .targets
-            .push(target_result(target, target_status_text(status)));
+            .push(target_result(target, target_status_text(status), now));
+        let guidance = status_guidance(status);
         eprintln!(
-            "[ai-news][enqueue] target={} protocol={} account={} group={} status={}",
+            "[ai-news][enqueue] target={} protocol={} account={} group={} issue={} status={} guidance={}",
             target.name,
             target.protocol.as_str(),
             mask(&target.account_id),
             mask(&target.group_id),
-            status_text
+            issue.date,
+            status_text,
+            guidance
         );
 
         if status == SendEnqueueStatus::Accepted {
@@ -333,13 +337,26 @@ fn target_status_text(status: SendEnqueueStatus) -> &'static str {
     }
 }
 
-fn target_result(target: &crate::config::Target, status: &str) -> TargetResult {
+fn status_guidance(status: SendEnqueueStatus) -> &'static str {
+    match status {
+        SendEnqueueStatus::Accepted => "宿主已接收入队",
+        SendEnqueueStatus::HostUnavailable => "检查宿主实时 Host API 绑定",
+        SendEnqueueStatus::InvalidRequest => "检查账号、群 ID 和消息段 JSON",
+        SendEnqueueStatus::BotNotFound => "检查宿主 bots.account_id",
+        SendEnqueueStatus::BotDisabled => "在宿主中启用目标 Bot",
+        SendEnqueueStatus::QueueFull => "等待下个正常轮询周期",
+        SendEnqueueStatus::HostShuttingDown => "宿主关闭中，停止当前轮次",
+    }
+}
+
+fn target_result(target: &crate::config::Target, status: &str, at: DateTime<Utc>) -> TargetResult {
     TargetResult {
         name: target.name.clone(),
         protocol: target.protocol.as_str().to_string(),
         account_id: mask(&target.account_id),
         group_id: mask(&target.group_id),
         status: status.to_string(),
+        at: at.to_rfc3339(),
     }
 }
 
@@ -384,8 +401,13 @@ pub fn status_text() -> String {
     }
     for target in snapshot.target_results.iter().take(8) {
         lines.push(format!(
-            "- {} [{}] {}/{}：{}",
-            target.name, target.protocol, target.account_id, target.group_id, target.status
+            "- {} [{}] {}/{}：{}（{}）",
+            target.name,
+            target.protocol,
+            target.account_id,
+            target.group_id,
+            target.status,
+            target.at
         ));
     }
     if snapshot.target_results.len() > 8 {
@@ -433,11 +455,12 @@ fn issue_hash_prefix(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use abi_stable_host_api::SendEnqueueStatus;
     use chrono::TimeZone;
+    use tiny_http::{Header, Response, Server};
 
     use super::*;
     use crate::config::{ImageMode, Target};
@@ -466,27 +489,39 @@ mod tests {
 ## 正文
 内容"#;
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct FakeSource {
         rss_body: Option<String>,
-        rss_calls: AtomicUsize,
-        markdown_calls: AtomicUsize,
-        image_calls: AtomicUsize,
+        rss_delay: Duration,
+        markdown_error: Option<String>,
+        image_error: Option<String>,
+        rss_calls: Arc<AtomicUsize>,
+        markdown_calls: Arc<AtomicUsize>,
+        image_calls: Arc<AtomicUsize>,
     }
 
     impl ContentSource for FakeSource {
         fn fetch_rss(&self, _url: &Url) -> Result<Vec<u8>, String> {
             self.rss_calls.fetch_add(1, Ordering::Relaxed);
+            if !self.rss_delay.is_zero() {
+                thread::sleep(self.rss_delay);
+            }
             Ok(self.rss_body.as_deref().unwrap_or(RSS).as_bytes().to_vec())
         }
 
         fn fetch_markdown(&self, _url: &Url) -> Result<String, String> {
             self.markdown_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = &self.markdown_error {
+                return Err(error.clone());
+            }
             Ok(MARKDOWN.to_string())
         }
 
         fn fetch_image(&self, _url: &Url) -> Result<ImageResponse, String> {
             self.image_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = &self.image_error {
+                return Err(error.clone());
+            }
             Ok(ImageResponse {
                 bytes: vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
                 content_type: Some("image/png".to_string()),
@@ -503,9 +538,10 @@ mod tests {
         qq_markdown: String,
     }
 
+    #[derive(Clone)]
     struct FakeSender {
-        calls: StdMutex<Vec<SendCall>>,
-        statuses: StdMutex<VecDeque<SendEnqueueStatus>>,
+        calls: Arc<StdMutex<Vec<SendCall>>>,
+        statuses: Arc<StdMutex<VecDeque<SendEnqueueStatus>>>,
     }
 
     impl FakeSender {
@@ -515,8 +551,8 @@ mod tests {
 
         fn scripted(statuses: Vec<SendEnqueueStatus>) -> Self {
             Self {
-                calls: StdMutex::new(Vec::new()),
-                statuses: StdMutex::new(statuses.into()),
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                statuses: Arc::new(StdMutex::new(statuses.into())),
             }
         }
     }
@@ -576,6 +612,56 @@ mod tests {
         config
     }
 
+    fn rss_for_current_day(issue_id: &str) -> String {
+        let date = Utc::now()
+            .with_timezone(&chrono_tz::Asia::Shanghai)
+            .date_naive();
+        format!(
+            r#"<rss version="2.0"><channel><title>AI</title><item>
+              <title>{date}</title><link>https://daily.juya.uk/issues/{date}/</link>
+              <guid>{issue_id}</guid><description>worker fixture</description>
+            </item></channel></rss>"#
+        )
+    }
+
+    fn wait_until(description: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !condition() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(condition(), "timed out waiting for {description}");
+    }
+
+    fn install_test_worker(
+        config: RuntimeConfig,
+        data_dir: PathBuf,
+        source: FakeSource,
+        sender: FakeSender,
+    ) {
+        stop().unwrap();
+        let state = DeliveryState::load(&data_dir).unwrap();
+        let configured_targets = config.targets.len();
+        let enabled_targets = config
+            .targets
+            .iter()
+            .filter(|target| target.enabled)
+            .count();
+        STOP.store(false, Ordering::Release);
+        let handle = thread::Builder::new()
+            .name("qimen-ai-news-test".to_string())
+            .spawn(move || worker_loop(config, data_dir, source, state, sender))
+            .unwrap();
+        *WORKER.lock().unwrap() = Some(handle);
+        replace_status(StatusSnapshot {
+            plugin_enabled: true,
+            worker_state: "running".to_string(),
+            configured_targets,
+            enabled_targets,
+            last_result: "测试 worker 已启动".to_string(),
+            ..StatusSnapshot::default()
+        });
+    }
+
     #[test]
     fn poll_sends_once_and_persists_deduplication() {
         let _guard = test_guard();
@@ -612,6 +698,77 @@ mod tests {
         assert_eq!(sender.calls.lock().unwrap().len(), 1);
         assert_eq!(source.rss_calls.load(Ordering::Relaxed), 2);
         assert_eq!(source.markdown_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn local_http_fixture_covers_poll_render_enqueue_and_deduplication() {
+        let _guard = test_guard();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", server.server_addr());
+        let feed = format!(
+            r#"<rss version="2.0"><channel><title>AI</title><item>
+              <title>2026-08-10</title><link>{base_url}/issues/2026-08-10/</link>
+              <guid>fixture-issue</guid><pubDate>Mon, 10 Aug 2026 01:30:00 GMT</pubDate>
+              <description>fixture fallback</description></item></channel></rss>"#
+        );
+        let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&requests);
+        let server_thread = thread::spawn(move || {
+            for _ in 0..3 {
+                let request = server.recv().unwrap();
+                let path = request.url().to_string();
+                recorded.lock().unwrap().push(path.clone());
+                let (body, content_type) = if path == "/rss.xml" {
+                    (feed.clone(), "application/rss+xml")
+                } else {
+                    (MARKDOWN.to_string(), "text/markdown; charset=utf-8")
+                };
+                request
+                    .respond(
+                        Response::from_string(body)
+                            .with_header(Header::from_bytes("Content-Type", content_type).unwrap()),
+                    )
+                    .unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let source = HttpContentSource::new_for_tests(Duration::from_secs(2)).unwrap();
+        let sender = FakeSender::accepted();
+        let mut config = config();
+        config.feed_url = Url::parse(&format!("{base_url}/rss.xml")).unwrap();
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
+
+        let first = run_poll(
+            &config,
+            dir.path(),
+            &source,
+            &sender,
+            &mut state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let second = run_poll(
+            &config,
+            dir.path(),
+            &source,
+            &sender,
+            &mut state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(first.accepted, 1);
+        assert_eq!(second.skipped, 1);
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        assert!(state.contains("onebot11|bot|group", "fixture-issue"));
+        server_thread.join().unwrap();
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["/rss.xml", "/markdown/2026-08-10.md", "/rss.xml"]
+        );
     }
 
     #[test]
@@ -846,6 +1003,38 @@ mod tests {
     }
 
     #[test]
+    fn cover_failure_degrades_to_text_and_still_persists_accepted() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let source = FakeSource {
+            image_error: Some("download timeout".to_string()),
+            ..FakeSource::default()
+        };
+        let sender = FakeSender::accepted();
+        let mut config = config();
+        config.targets[0].image_mode = ImageMode::Cover;
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+
+        let result = run_poll(
+            &config,
+            dir.path(),
+            &source,
+            &sender,
+            &mut state,
+            Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(result.accepted, 1);
+        let calls = sender.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].has_cover);
+        assert!(calls[0].onebot_text.contains("查看全文"));
+        assert!(state.contains("onebot11|bot|group", "issue-1"));
+    }
+
+    #[test]
     fn host_shutting_down_stops_current_target_loop() {
         let _guard = test_guard();
         let dir = tempfile::tempdir().unwrap();
@@ -907,6 +1096,50 @@ mod tests {
     }
 
     #[test]
+    fn reload_state_skips_existing_target_and_sends_only_new_target() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let source = FakeSource::default();
+        let first_sender = FakeSender::accepted();
+        let first_config = config();
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
+        let mut first_state = DeliveryState::load(dir.path()).unwrap();
+        run_poll(
+            &first_config,
+            dir.path(),
+            &source,
+            &first_sender,
+            &mut first_state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let mut reloaded_config = first_config;
+        reloaded_config
+            .targets
+            .push(target("new", Protocol::QqOfficial, "new-app", "new-openid"));
+        let second_sender = FakeSender::accepted();
+        let mut reloaded_state = DeliveryState::load(dir.path()).unwrap();
+        let result = run_poll(
+            &reloaded_config,
+            dir.path(),
+            &source,
+            &second_sender,
+            &mut reloaded_state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.accepted, 1);
+        let calls = second_sender.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].key, "qq-official|new-app|new-openid");
+    }
+
+    #[test]
     fn fifty_queue_full_targets_do_not_repeat_http_or_send_attempts() {
         let _guard = test_guard();
         let dir = tempfile::tempdir().unwrap();
@@ -964,6 +1197,7 @@ mod tests {
                     account_id: "bot***001".to_string(),
                     group_id: "gro***001".to_string(),
                     status: "宿主已接收入队".to_string(),
+                    at: "2026-08-10T02:00:00+00:00".to_string(),
                 })
                 .collect(),
         });
@@ -976,6 +1210,7 @@ mod tests {
         assert!(!output.contains("target-8"));
         assert!(output.contains("其余 2 个目标已省略"));
         assert!(!output.contains("Accepted"));
+        assert!(output.contains("2026-08-10T02:00:00+00:00"));
     }
 
     #[test]
@@ -1019,5 +1254,100 @@ mod tests {
         let output = status_text();
         assert!(output.contains("Worker：stopped"));
         assert!(!state_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn shutdown_interrupts_worker_sleep_and_prevents_late_sends() {
+        let _guard = test_guard();
+        let root = tempfile::tempdir().unwrap();
+        let source = FakeSource {
+            rss_body: Some(rss_for_current_day("worker-sleep")),
+            ..FakeSource::default()
+        };
+        let sender = FakeSender::accepted();
+        let observed_sender = sender.clone();
+        let mut config = config();
+        config.poll_interval = Duration::from_secs(60);
+        install_test_worker(config, root.path().to_path_buf(), source, sender);
+        wait_until("first worker send", || {
+            observed_sender.calls.lock().unwrap().len() == 1
+        });
+
+        let started = Instant::now();
+        stop().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let calls_after_stop = observed_sender.calls.lock().unwrap().len();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            observed_sender.calls.lock().unwrap().len(),
+            calls_after_stop
+        );
+        assert!(status_text().contains("Worker：stopped"));
+    }
+
+    #[test]
+    fn shutdown_waits_for_bounded_inflight_fetch_then_joins() {
+        let _guard = test_guard();
+        let root = tempfile::tempdir().unwrap();
+        let source = FakeSource {
+            rss_delay: Duration::from_millis(200),
+            ..FakeSource::default()
+        };
+        let observed_source = source.clone();
+        let sender = FakeSender::accepted();
+        install_test_worker(config(), root.path().to_path_buf(), source, sender);
+        wait_until("RSS fetch entry", || {
+            observed_source.rss_calls.load(Ordering::Relaxed) == 1
+        });
+
+        let started = Instant::now();
+        stop().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(elapsed >= Duration::from_millis(100));
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(status_text().contains("Worker：stopped"));
+    }
+
+    #[test]
+    fn ten_enabled_worker_reloads_leave_no_running_thread() {
+        let _guard = test_guard();
+        let root = tempfile::tempdir().unwrap();
+
+        for iteration in 0..10 {
+            let source = FakeSource::default();
+            let observed_source = source.clone();
+            install_test_worker(
+                config(),
+                root.path().to_path_buf(),
+                source,
+                FakeSender::accepted(),
+            );
+            wait_until(&format!("reload poll {iteration}"), || {
+                observed_source.rss_calls.load(Ordering::Relaxed) == 1
+            });
+            stop().unwrap();
+            assert!(WORKER.lock().unwrap().is_none());
+        }
+
+        assert!(status_text().contains("Worker：stopped"));
+    }
+
+    #[test]
+    fn enqueue_status_guidance_is_actionable_for_every_status() {
+        let cases = [
+            SendEnqueueStatus::Accepted,
+            SendEnqueueStatus::HostUnavailable,
+            SendEnqueueStatus::InvalidRequest,
+            SendEnqueueStatus::BotNotFound,
+            SendEnqueueStatus::BotDisabled,
+            SendEnqueueStatus::QueueFull,
+            SendEnqueueStatus::HostShuttingDown,
+        ];
+
+        for status in cases {
+            assert!(!status_guidance(status).is_empty());
+        }
     }
 }
