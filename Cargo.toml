@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 abi-stable-host-api = "=0.1.13"
 qimen-dynamic-plugin-derive = "=0.1.13"
 abi_stable = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 html-escape = "0.2"
