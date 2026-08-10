@@ -129,6 +129,8 @@ cargo build --locked --release
 
 将动态库复制到 QimenBot `plugin_bin_dir`，默认是 `plugins/bin/`，然后在 Web 插件页点击重新扫描。动态库必须匹配宿主操作系统、CPU 和 C 运行时；musl 宿主不支持动态加载。
 
+主分支 CI 会显式构建表中的三个 target。Windows 记录大小和 SHA256；Linux 在 Debian 11 容器中额外运行 `file`、`ldd`、`readelf --version-info` 并记录实际 `min_glibc`。这些结果只作为 14 天的 CI 证据，不创建 Release，也不代表已经通过 QimenBot 宿主加载验收。
+
 ## 候选版本发布
 
 推送与 `Cargo.toml` 版本一致的 `v*` tag 会触发 Release 工作流。工作流先执行格式、Clippy 和全部测试，再构建以下固定资产：
@@ -141,7 +143,7 @@ cargo build --locked --release
 
 ## 依赖策略
 
-Dependabot 每周检查 Cargo 依赖和 GitHub Actions。依赖升级仍必须通过格式、Clippy、全部测试和 release 构建；发布前额外检查 RustSec 公告及新增依赖许可证。项目接受 Apache-2.0、MIT、BSD、ISC、Unicode、Zlib 等常见兼容许可证；GPL/AGPL、未知许可证、私有 registry、本地 path 和浮动 Git 分支需要维护者明确审查，不能自动合并。
+Dependabot 每周检查 Cargo 依赖和 GitHub Actions。主分支 CI 固定使用 `cargo-audit 0.22.2` 检查 `Cargo.lock` 的 RustSec 漏洞；依赖升级仍必须通过格式、Clippy、全部测试和 release 构建。新增依赖许可证继续人工审查：项目接受 Apache-2.0、MIT、BSD、ISC、Unicode、Zlib 等常见兼容许可证；GPL/AGPL、未知许可证、私有 registry、本地 path 和浮动 Git 分支需要维护者明确确认，不能自动合并。
 
 ## 状态文件
 

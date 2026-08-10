@@ -1,0 +1,4 @@
+[ai-news][enqueue] level=info target=onebot-a protocol=onebot11 account=123***789 group=abc***ghi issue=2026-08-10 status=Accepted guidance=宿主已接收入队
+[ai-news][enqueue] level=warn target=official protocol=qq-official account=987***321 group=ihg***cba issue=2026-08-10 status=QueueFull guidance=等待下个正常轮询周期
+[ai-news][enqueue] level=info target=onebot-b protocol=onebot11 account=555***777 group=222***444 issue=2026-08-10 status=Accepted guidance=宿主已接收入队
+[ai-news][poll] level=info 期号 2026-08-10：已入队 2，跳过 0，失败 1 duration_ms=31 targets=3

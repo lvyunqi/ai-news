@@ -24,3 +24,111 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: cargo build --locked --release
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-audit-0.22.2
+      - name: Install cargo-audit 0.22.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo audit --version >/dev/null 2>&1; then
+            cargo install cargo-audit --locked --version 0.22.2
+          fi
+      - name: Fetch RustSec advisory database
+        shell: bash
+        run: git -c http.version=HTTP/1.1 clone --depth 1 https://github.com/RustSec/advisory-db.git "$RUNNER_TEMP/advisory-db"
+      - name: Audit Cargo.lock
+        shell: bash
+        run: cargo audit --db "$RUNNER_TEMP/advisory-db" --no-fetch
+
+  windows-x64-target:
+    needs: test
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-target-${{ env.TARGET }}
+      - run: cargo build --locked --release --target $env:TARGET
+      - name: Record Windows target evidence
+        shell: pwsh
+        run: |
+          $artifact = "target/$env:TARGET/release/qimen_dynamic_plugin_ai_news.dll"
+          $hash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item -LiteralPath $artifact).Length
+          New-Item -ItemType Directory -Force ci-evidence | Out-Null
+          [ordered]@{
+            target = $env:TARGET
+            size_bytes = $size
+            sha256 = $hash
+            min_glibc = $null
+          } | ConvertTo-Json | Set-Content -LiteralPath "ci-evidence/$env:TARGET.json" -Encoding utf8
+          Write-Output "::notice file=Cargo.toml,title=Windows target evidence::target=$env:TARGET size_bytes=$size sha256=$hash"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-evidence-${{ env.TARGET }}
+          path: ci-evidence/*
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-targets:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    container: debian:11
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Install Linux build and inspection tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates build-essential curl binutils file
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-target-${{ env.TARGET }}
+      - run: cargo build --locked --release --target "$TARGET"
+      - name: Record Linux target evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="target/$TARGET/release/libqimen_dynamic_plugin_ai_news.so"
+          mkdir -p ci-evidence
+          file "$artifact" | tee "ci-evidence/$TARGET.file.txt"
+          ldd "$artifact" | tee "ci-evidence/$TARGET.ldd.txt"
+          readelf --version-info "$artifact" | tee "ci-evidence/$TARGET.readelf.txt" >/dev/null
+          min_glibc=$(grep -oE 'GLIBC_[0-9]+\.[0-9]+' "ci-evidence/$TARGET.readelf.txt" | sort -V | tail -n 1 | sed 's/^GLIBC_//')
+          test -n "$min_glibc"
+          sha256=$(sha256sum "$artifact" | cut -d ' ' -f 1)
+          size=$(stat -c '%s' "$artifact")
+          printf '{\n  "target": "%s",\n  "size_bytes": %s,\n  "sha256": "%s",\n  "min_glibc": "%s"\n}\n' \
+            "$TARGET" "$size" "$sha256" "$min_glibc" > "ci-evidence/$TARGET.json"
+          echo "::notice file=Cargo.toml,title=Linux target evidence::target=$TARGET size_bytes=$size sha256=$sha256 min_glibc=$min_glibc"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-evidence-${{ env.TARGET }}
+          path: ci-evidence/*
+          if-no-files-found: error
+          retention-days: 14

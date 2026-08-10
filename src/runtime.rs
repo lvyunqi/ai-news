@@ -1551,6 +1551,72 @@ mod tests {
     }
 
     #[test]
+    fn mixed_three_target_poll_and_log_fixture_are_stable() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let source = FakeSource::default();
+        let sender = FakeSender::scripted(vec![
+            SendEnqueueStatus::Accepted,
+            SendEnqueueStatus::QueueFull,
+            SendEnqueueStatus::Accepted,
+        ]);
+        let mut config = config();
+        config.targets = vec![
+            target("onebot-a", Protocol::OneBot11, "123456789", "abcdefghi"),
+            target("official", Protocol::QqOfficial, "987654321", "ihgfedcba"),
+            target("onebot-b", Protocol::OneBot11, "555666777", "222333444"),
+        ];
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
+
+        let result = run_poll(
+            &config,
+            dir.path(),
+            &source,
+            &sender,
+            &mut state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(result.accepted, 2);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.targets.len(), 3);
+        assert_eq!(source.rss_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.markdown_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.image_calls.load(Ordering::Relaxed), 0);
+        assert!(state.contains("onebot11|123456789|abcdefghi", "issue-1"));
+        assert!(!state.contains("qq-official|987654321|ihgfedcba", "issue-1"));
+        assert!(state.contains("onebot11|555666777|222333444", "issue-1"));
+        let calls = sender.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].protocol, Protocol::OneBot11);
+        assert_eq!(calls[1].protocol, Protocol::QqOfficial);
+        assert_eq!(calls[2].protocol, Protocol::OneBot11);
+
+        let statuses = [
+            SendEnqueueStatus::Accepted,
+            SendEnqueueStatus::QueueFull,
+            SendEnqueueStatus::Accepted,
+        ];
+        let mut log_lines = config
+            .targets
+            .iter()
+            .zip(statuses)
+            .map(|(target, status)| enqueue_log_line(target, "2026-08-10", status))
+            .collect::<Vec<_>>();
+        log_lines.push(poll_log_line(&result, Duration::from_millis(31)));
+        let output = log_lines.join("\n");
+        let expected = include_str!("../fixtures/expected/mixed-three-target-log.txt")
+            .replace("\r\n", "\n")
+            .trim_end()
+            .to_string();
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
     fn disabled_start_and_repeated_stop_are_idempotent() {
         let _guard = test_guard();
         let dir = tempfile::tempdir().unwrap();
