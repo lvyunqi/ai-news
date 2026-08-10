@@ -33,6 +33,7 @@ pub struct ImageResponse {
     pub content_type: Option<String>,
 }
 
+#[derive(Debug)]
 struct HttpResponse {
     bytes: Vec<u8>,
     content_type: Option<String>,
@@ -75,6 +76,19 @@ impl HttpContentSource {
         Ok(())
     }
 
+    fn resolve_redirect_url(
+        &self,
+        current: &Url,
+        location: &str,
+        require_public: bool,
+    ) -> Result<Url, String> {
+        let next = current
+            .join(location)
+            .map_err(|error| format!("重定向 URL 无效：{error}"))?;
+        self.validate_request_url(&next, require_public)?;
+        Ok(next)
+    }
+
     fn fetch_bytes(
         &self,
         url: &Url,
@@ -87,7 +101,7 @@ impl HttpContentSource {
             .client
             .get(url.clone())
             .send()
-            .map_err(|error| format!("请求失败：{error}"))?;
+            .map_err(|error| format!("请求失败：{}", error.without_url()))?;
         if response.status().is_redirection() {
             if max_redirects == 0 {
                 return Err("重定向次数超过限制".to_string());
@@ -98,14 +112,12 @@ impl HttpContentSource {
                 .ok_or_else(|| "重定向响应缺少 Location".to_string())?
                 .to_str()
                 .map_err(|_| "重定向 Location 不是有效文本".to_string())?;
-            let next = url
-                .join(location)
-                .map_err(|error| format!("重定向 URL 无效：{error}"))?;
+            let next = self.resolve_redirect_url(url, location, require_public)?;
             return self.fetch_bytes(&next, limit, max_redirects - 1, require_public);
         }
         let response = response
             .error_for_status()
-            .map_err(|error| format!("服务器返回错误状态：{error}"))?;
+            .map_err(|error| format!("服务器返回错误状态：{}", error.without_url()))?;
 
         let content_type = response
             .headers()
@@ -469,5 +481,62 @@ mod tests {
         let error = source.validate_request_url(&private, true).unwrap_err();
 
         assert!(error.contains("公网 HTTPS"));
+    }
+
+    #[test]
+    fn public_image_redirect_to_private_address_is_rejected_before_request() {
+        let source = HttpContentSource::new_for_tests(Duration::from_secs(1)).unwrap();
+        let public = Url::parse("https://assets.juya.uk/cover.png").unwrap();
+
+        let error = source
+            .resolve_redirect_url(&public, "https://127.0.0.1/private.png", true)
+            .unwrap_err();
+
+        assert!(error.contains("公网 HTTPS"));
+    }
+
+    #[test]
+    fn image_redirects_stop_after_three_hops() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/image", server.server_addr())).unwrap();
+        let handle = thread::spawn(move || {
+            for _ in 0..4 {
+                let request = server.recv().unwrap();
+                let location = Header::from_bytes("Location", "/image").unwrap();
+                request
+                    .respond(Response::empty(StatusCode(302)).with_header(location))
+                    .unwrap();
+            }
+        });
+        let source = HttpContentSource::new_for_tests(Duration::from_secs(2)).unwrap();
+
+        let error = source
+            .fetch_bytes(&url, crate::media::MAX_IMAGE_BYTES, 3, false)
+            .unwrap_err();
+
+        assert!(error.contains("重定向次数超过限制"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn http_status_errors_do_not_expose_url_query() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/missing?token=super-secret",
+            server.server_addr()
+        ))
+        .unwrap();
+        let handle = thread::spawn(move || {
+            let request = server.recv().unwrap();
+            request.respond(Response::empty(StatusCode(404))).unwrap();
+        });
+        let source = HttpContentSource::new_for_tests(Duration::from_secs(2)).unwrap();
+
+        let error = source.fetch_markdown(&url).unwrap_err();
+
+        assert!(error.contains("404"));
+        assert!(!error.contains("super-secret"));
+        assert!(!error.contains("?token="));
+        handle.join().unwrap();
     }
 }

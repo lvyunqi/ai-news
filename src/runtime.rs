@@ -159,12 +159,8 @@ fn worker_loop(
         match result {
             Ok(result) => apply_poll_result(result, now, elapsed),
             Err(error) => {
-                eprintln!("[ai-news][poll] {error}");
-                update_status(|status| {
-                    status.last_poll_at = Some(now.to_rfc3339());
-                    status.last_poll_duration_ms = Some(elapsed.as_millis());
-                    status.last_result = error.clone();
-                });
+                eprintln!("[ai-news][poll] level=warn {error}");
+                apply_poll_error(error.clone(), now, elapsed);
                 if error.starts_with("状态写入失败") {
                     update_status(|status| status.worker_state = "protected".to_string());
                     break;
@@ -275,20 +271,12 @@ fn run_poll(
             };
 
         let status = sender.send(target, &content, cover);
-        let status_text = status_name(status);
         result
             .targets
             .push(target_result(target, target_status_text(status), now));
-        let guidance = status_guidance(status);
         eprintln!(
-            "[ai-news][enqueue] target={} protocol={} account={} group={} issue={} status={} guidance={}",
-            target.name,
-            target.protocol.as_str(),
-            mask(&target.account_id),
-            mask(&target.group_id),
-            issue.date,
-            status_text,
-            guidance
+            "{}",
+            enqueue_log_line(target, &issue.date.to_string(), status)
         );
 
         if status == SendEnqueueStatus::Accepted {
@@ -313,12 +301,7 @@ fn run_poll(
 }
 
 fn apply_poll_result(result: PollResult, now: DateTime<Utc>, elapsed: Duration) {
-    eprintln!(
-        "[ai-news][poll] {} duration_ms={} targets={}",
-        result.message,
-        elapsed.as_millis(),
-        result.targets.len()
-    );
+    eprintln!("{}", poll_log_line(&result, elapsed));
     update_status(|status| {
         status.last_poll_at = Some(now.to_rfc3339());
         status.last_poll_duration_ms = Some(elapsed.as_millis());
@@ -326,6 +309,14 @@ fn apply_poll_result(result: PollResult, now: DateTime<Utc>, elapsed: Duration) 
         status.last_issue_date = result.issue_date;
         status.last_issue_hash = result.issue_id.as_deref().map(issue_hash_prefix);
         status.target_results = result.targets;
+    });
+}
+
+fn apply_poll_error(error: String, now: DateTime<Utc>, elapsed: Duration) {
+    update_status(|status| {
+        status.last_poll_at = Some(now.to_rfc3339());
+        status.last_poll_duration_ms = Some(elapsed.as_millis());
+        status.last_result = error;
     });
 }
 
@@ -337,16 +328,59 @@ fn target_status_text(status: SendEnqueueStatus) -> &'static str {
     }
 }
 
-fn status_guidance(status: SendEnqueueStatus) -> &'static str {
+fn status_guidance(status: SendEnqueueStatus, target: &crate::config::Target) -> &'static str {
     match status {
         SendEnqueueStatus::Accepted => "宿主已接收入队",
         SendEnqueueStatus::HostUnavailable => "检查宿主实时 Host API 绑定",
-        SendEnqueueStatus::InvalidRequest => "检查账号、群 ID 和消息段 JSON",
+        SendEnqueueStatus::InvalidRequest
+            if target.account_id.trim().is_empty() || target.group_id.trim().is_empty() =>
+        {
+            "配置账号或群 ID 为空"
+        }
+        SendEnqueueStatus::InvalidRequest => "宿主拒绝请求，检查消息段 JSON 和目标类型",
         SendEnqueueStatus::BotNotFound => "检查宿主 bots.account_id",
         SendEnqueueStatus::BotDisabled => "在宿主中启用目标 Bot",
         SendEnqueueStatus::QueueFull => "等待下个正常轮询周期",
         SendEnqueueStatus::HostShuttingDown => "宿主关闭中，停止当前轮次",
     }
+}
+
+fn status_log_level(status: SendEnqueueStatus) -> &'static str {
+    match status {
+        SendEnqueueStatus::Accepted | SendEnqueueStatus::HostShuttingDown => "info",
+        SendEnqueueStatus::HostUnavailable
+        | SendEnqueueStatus::InvalidRequest
+        | SendEnqueueStatus::BotNotFound
+        | SendEnqueueStatus::BotDisabled
+        | SendEnqueueStatus::QueueFull => "warn",
+    }
+}
+
+fn enqueue_log_line(
+    target: &crate::config::Target,
+    issue_date: &str,
+    status: SendEnqueueStatus,
+) -> String {
+    format!(
+        "[ai-news][enqueue] level={} target={} protocol={} account={} group={} issue={} status={} guidance={}",
+        status_log_level(status),
+        target.name,
+        target.protocol.as_str(),
+        mask(&target.account_id),
+        mask(&target.group_id),
+        issue_date,
+        status_name(status),
+        status_guidance(status, target)
+    )
+}
+
+fn poll_log_line(result: &PollResult, elapsed: Duration) -> String {
+    format!(
+        "[ai-news][poll] level=info {} duration_ms={} targets={}",
+        result.message,
+        elapsed.as_millis(),
+        result.targets.len()
+    )
 }
 
 fn target_result(target: &crate::config::Target, status: &str, at: DateTime<Utc>) -> TargetResult {
@@ -492,6 +526,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeSource {
         rss_body: Option<String>,
+        rss_error: Option<String>,
         rss_delay: Duration,
         markdown_error: Option<String>,
         image_error: Option<String>,
@@ -505,6 +540,9 @@ mod tests {
             self.rss_calls.fetch_add(1, Ordering::Relaxed);
             if !self.rss_delay.is_zero() {
                 thread::sleep(self.rss_delay);
+            }
+            if let Some(error) = &self.rss_error {
+                return Err(error.clone());
             }
             Ok(self.rss_body.as_deref().unwrap_or(RSS).as_bytes().to_vec())
         }
@@ -1140,6 +1178,64 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_fan_out_reloads_persisted_targets_and_resumes_remaining_targets() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let source = FakeSource::default();
+        let mut config = mixed_config();
+        config.targets.push(target(
+            "third",
+            Protocol::OneBot11,
+            "bot-third",
+            "group-third",
+        ));
+        let first_sender = FakeSender::scripted(vec![
+            SendEnqueueStatus::Accepted,
+            SendEnqueueStatus::HostShuttingDown,
+        ]);
+        let mut first_state = DeliveryState::load(dir.path()).unwrap();
+        let first_stop = AtomicBool::new(false);
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
+
+        let first = run_poll(
+            &config,
+            dir.path(),
+            &source,
+            &first_sender,
+            &mut first_state,
+            now,
+            &first_stop,
+        )
+        .unwrap();
+
+        assert_eq!(first.accepted, 1);
+        assert_eq!(first.failed, 1);
+        assert!(first_stop.load(Ordering::Acquire));
+        assert!(first_state.contains("onebot11|bot|group", "issue-1"));
+        assert!(!first_state.contains("qq-official|app|group-openid", "issue-1"));
+
+        let resumed_sender = FakeSender::accepted();
+        let mut resumed_state = DeliveryState::load(dir.path()).unwrap();
+        let resumed = run_poll(
+            &config,
+            dir.path(),
+            &source,
+            &resumed_sender,
+            &mut resumed_state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(resumed.skipped, 1);
+        assert_eq!(resumed.accepted, 2);
+        let calls = resumed_sender.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].key, "qq-official|app|group-openid");
+        assert_eq!(calls[1].key, "onebot11|bot-third|group-third");
+    }
+
+    #[test]
     fn fifty_queue_full_targets_do_not_repeat_http_or_send_attempts() {
         let _guard = test_guard();
         let dir = tempfile::tempdir().unwrap();
@@ -1174,6 +1270,39 @@ mod tests {
         assert_eq!(source.rss_calls.load(Ordering::Relaxed), 1);
         assert_eq!(source.markdown_calls.load(Ordering::Relaxed), 1);
         assert_eq!(source.image_calls.load(Ordering::Relaxed), 0);
+        assert!(state.deliveries.is_empty());
+    }
+
+    #[test]
+    fn one_hundred_feed_failures_make_one_request_per_poll_without_downstream_work() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let source = FakeSource {
+            rss_error: Some("connection reset".to_string()),
+            ..FakeSource::default()
+        };
+        let sender = FakeSender::accepted();
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
+
+        for _ in 0..100 {
+            let error = run_poll(
+                &config(),
+                dir.path(),
+                &source,
+                &sender,
+                &mut state,
+                now,
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+            assert_eq!(error, "RSS 获取失败：connection reset");
+        }
+
+        assert_eq!(source.rss_calls.load(Ordering::Relaxed), 100);
+        assert_eq!(source.markdown_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(source.image_calls.load(Ordering::Relaxed), 0);
+        assert!(sender.calls.lock().unwrap().is_empty());
         assert!(state.deliveries.is_empty());
     }
 
@@ -1239,6 +1368,189 @@ mod tests {
     }
 
     #[test]
+    fn status_snapshots_cover_stopped_running_and_protected_states() {
+        let _guard = test_guard();
+        let scenarios = [
+            (
+                "disabled",
+                StatusSnapshot {
+                    last_result: "插件配置为关闭".to_string(),
+                    ..StatusSnapshot::default()
+                },
+            ),
+            (
+                "no-targets",
+                StatusSnapshot {
+                    plugin_enabled: true,
+                    configured_targets: 2,
+                    last_result: "没有启用的推送目标".to_string(),
+                    ..StatusSnapshot::default()
+                },
+            ),
+            (
+                "no-content",
+                StatusSnapshot {
+                    plugin_enabled: true,
+                    worker_state: "running".to_string(),
+                    configured_targets: 2,
+                    enabled_targets: 2,
+                    last_poll_at: Some("2026-08-11T00:00:00+00:00".to_string()),
+                    last_poll_duration_ms: Some(7),
+                    last_result: "2026-08-11 没有新的当天早报".to_string(),
+                    ..StatusSnapshot::default()
+                },
+            ),
+            (
+                "partial-failure",
+                StatusSnapshot {
+                    plugin_enabled: true,
+                    worker_state: "running".to_string(),
+                    configured_targets: 2,
+                    enabled_targets: 2,
+                    last_poll_at: Some("2026-08-11T00:01:00+00:00".to_string()),
+                    last_poll_duration_ms: Some(19),
+                    last_result: "期号 2026-08-11：已入队 1，跳过 0，失败 1".to_string(),
+                    last_issue_date: Some("2026-08-11".to_string()),
+                    last_issue_hash: Some("deadbeef".to_string()),
+                    target_results: vec![
+                        TargetResult {
+                            name: "onebot".to_string(),
+                            protocol: "onebot11".to_string(),
+                            account_id: "123***789".to_string(),
+                            group_id: "456***012".to_string(),
+                            status: "宿主已接收入队".to_string(),
+                            at: "2026-08-11T00:01:00+00:00".to_string(),
+                        },
+                        TargetResult {
+                            name: "official".to_string(),
+                            protocol: "qq-official".to_string(),
+                            account_id: "987***321".to_string(),
+                            group_id: "ope***nid".to_string(),
+                            status: "QueueFull".to_string(),
+                            at: "2026-08-11T00:01:00+00:00".to_string(),
+                        },
+                    ],
+                },
+            ),
+            (
+                "protected",
+                StatusSnapshot {
+                    plugin_enabled: true,
+                    worker_state: "protected".to_string(),
+                    configured_targets: 1,
+                    enabled_targets: 1,
+                    last_result: "状态文件版本 2 高于当前支持版本 1".to_string(),
+                    ..StatusSnapshot::default()
+                },
+            ),
+        ];
+        let output = scenarios
+            .into_iter()
+            .map(|(name, snapshot)| {
+                replace_status(snapshot);
+                format!("=== {name} ===\n{}", status_text())
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let expected = include_str!("../fixtures/expected/status-scenarios.txt")
+            .replace("\r\n", "\n")
+            .trim_end()
+            .to_string();
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn no_content_and_feed_failure_have_distinct_status_outputs() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 11, 0, 0, 0).unwrap();
+        replace_status(StatusSnapshot {
+            plugin_enabled: true,
+            worker_state: "running".to_string(),
+            configured_targets: 1,
+            enabled_targets: 1,
+            last_result: "等待轮询".to_string(),
+            ..StatusSnapshot::default()
+        });
+        let no_content_source = FakeSource::default();
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+        let no_content = run_poll(
+            &config(),
+            dir.path(),
+            &no_content_source,
+            &FakeSender::accepted(),
+            &mut state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let no_content_log = poll_log_line(&no_content, Duration::from_millis(5));
+        assert!(no_content_log.starts_with("[ai-news][poll] level=info "));
+        assert!(no_content_log.contains("没有新的当天早报"));
+        apply_poll_result(no_content, now, Duration::from_millis(5));
+        let no_content_output = status_text();
+
+        let failure_source = FakeSource {
+            rss_error: Some("timeout".to_string()),
+            ..FakeSource::default()
+        };
+        let error = run_poll(
+            &config(),
+            dir.path(),
+            &failure_source,
+            &FakeSender::accepted(),
+            &mut state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        apply_poll_error(error, now, Duration::from_millis(11));
+        let failure_output = status_text();
+
+        assert!(no_content_output.contains("没有新的当天早报"));
+        assert!(!no_content_output.contains("RSS 获取失败"));
+        assert!(failure_output.contains("RSS 获取失败：timeout"));
+        assert!(!failure_output.contains("没有新的当天早报"));
+    }
+
+    #[test]
+    fn sanitized_log_fixture_has_fixed_levels_and_no_message_body() {
+        let _guard = test_guard();
+        let accepted_target = target("onebot", Protocol::OneBot11, "123456789", "abcdefghi");
+        let queue_target = target("official", Protocol::QqOfficial, "987654321", "ihgfedcba");
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
+        let result = PollResult {
+            issue_date: Some("2026-08-10".to_string()),
+            issue_id: Some("issue-with-secret-query".to_string()),
+            accepted: 1,
+            skipped: 0,
+            failed: 1,
+            targets: vec![
+                target_result(&accepted_target, "宿主已接收入队", now),
+                target_result(&queue_target, "QueueFull", now),
+            ],
+            message: "期号 2026-08-10：已入队 1，跳过 0，失败 1".to_string(),
+        };
+        let output = [
+            enqueue_log_line(&accepted_target, "2026-08-10", SendEnqueueStatus::Accepted),
+            enqueue_log_line(&queue_target, "2026-08-10", SendEnqueueStatus::QueueFull),
+            poll_log_line(&result, Duration::from_millis(23)),
+        ]
+        .join("\n");
+        let expected = include_str!("../fixtures/expected/log-sample.txt")
+            .replace("\r\n", "\n")
+            .trim_end()
+            .to_string();
+
+        assert_eq!(output, expected);
+        assert!(!output.contains("123456789"));
+        assert!(!output.contains("abcdefghi"));
+        assert!(!output.contains("issue-with-secret-query"));
+        assert!(!output.contains("YWJjZGVm"));
+    }
+
+    #[test]
     fn disabled_start_and_repeated_stop_are_idempotent() {
         let _guard = test_guard();
         let dir = tempfile::tempdir().unwrap();
@@ -1254,6 +1566,34 @@ mod tests {
         let output = status_text();
         assert!(output.contains("Worker：stopped"));
         assert!(!state_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn disabled_and_empty_target_starts_create_no_worker_or_http_request() {
+        let _guard = test_guard();
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let feed_url = Url::parse(&format!("http://{}/rss.xml", server.server_addr())).unwrap();
+
+        let mut disabled = config();
+        disabled.enabled = false;
+        disabled.feed_url = feed_url.clone();
+        start(disabled, root.path().to_path_buf()).unwrap();
+        assert!(WORKER.lock().unwrap().is_none());
+
+        let mut empty = config();
+        empty.targets.clear();
+        empty.feed_url = feed_url;
+        start(empty, root.path().to_path_buf()).unwrap();
+        assert!(WORKER.lock().unwrap().is_none());
+        assert!(
+            server
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!state_path(root.path()).exists());
+        stop().unwrap();
     }
 
     #[test]
@@ -1336,18 +1676,30 @@ mod tests {
 
     #[test]
     fn enqueue_status_guidance_is_actionable_for_every_status() {
+        let valid_target = target("status", Protocol::OneBot11, "account", "group");
         let cases = [
-            SendEnqueueStatus::Accepted,
-            SendEnqueueStatus::HostUnavailable,
-            SendEnqueueStatus::InvalidRequest,
-            SendEnqueueStatus::BotNotFound,
-            SendEnqueueStatus::BotDisabled,
-            SendEnqueueStatus::QueueFull,
-            SendEnqueueStatus::HostShuttingDown,
+            (SendEnqueueStatus::Accepted, "info"),
+            (SendEnqueueStatus::HostUnavailable, "warn"),
+            (SendEnqueueStatus::InvalidRequest, "warn"),
+            (SendEnqueueStatus::BotNotFound, "warn"),
+            (SendEnqueueStatus::BotDisabled, "warn"),
+            (SendEnqueueStatus::QueueFull, "warn"),
+            (SendEnqueueStatus::HostShuttingDown, "info"),
         ];
 
-        for status in cases {
-            assert!(!status_guidance(status).is_empty());
+        for (status, level) in cases {
+            assert_eq!(status_log_level(status), level);
+            assert!(!status_guidance(status, &valid_target).is_empty());
         }
+
+        let empty_target = target("invalid", Protocol::OneBot11, "", "");
+        assert_eq!(
+            status_guidance(SendEnqueueStatus::InvalidRequest, &empty_target),
+            "配置账号或群 ID 为空"
+        );
+        assert_eq!(
+            status_guidance(SendEnqueueStatus::InvalidRequest, &valid_target),
+            "宿主拒绝请求，检查消息段 JSON 和目标类型"
+        );
     }
 }
