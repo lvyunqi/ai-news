@@ -168,4 +168,76 @@ mod tests {
                 .any(|entry| entry.file_name().to_string_lossy().contains("corrupt"))
         );
     }
+
+    #[test]
+    fn rejects_unknown_future_version_without_treating_it_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(state_path(dir.path()), br#"{"version":2,"deliveries":{}}"#).unwrap();
+
+        let error = DeliveryState::load(dir.path()).unwrap_err();
+
+        assert!(error.contains("版本 2 不受支持"));
+        assert!(state_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn persisted_state_has_explicit_version_and_only_delivery_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+        state
+            .mark_accepted(
+                dir.path(),
+                "qq-official|app|group-openid".to_string(),
+                "issue-1".to_string(),
+                "2026-08-10".to_string(),
+            )
+            .unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(state_path(dir.path())).unwrap()).unwrap();
+        assert_eq!(value["version"], 1);
+        let text = value.to_string();
+        assert!(!text.contains("base64"));
+        assert!(!text.contains("markdown"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("bot_instance"));
+    }
+
+    #[test]
+    fn write_failure_rolls_back_in_memory_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_data_dir = dir.path().join("not-a-directory");
+        fs::write(&invalid_data_dir, b"file").unwrap();
+        let mut state = DeliveryState::default();
+
+        let error = state
+            .mark_accepted(
+                &invalid_data_dir,
+                "onebot11|bot|group".to_string(),
+                "issue".to_string(),
+                "2026-08-10".to_string(),
+            )
+            .unwrap_err();
+
+        assert!(error.contains("状态目录"));
+        assert!(!state.contains("onebot11|bot|group", "issue"));
+    }
+
+    #[test]
+    fn creates_missing_state_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("nested").join("ai-news");
+        let mut state = DeliveryState::load(&data_dir).unwrap();
+
+        state
+            .mark_accepted(
+                &data_dir,
+                "onebot11|bot|group".to_string(),
+                "issue".to_string(),
+                "2026-08-10".to_string(),
+            )
+            .unwrap();
+
+        assert!(state_path(&data_dir).is_file());
+    }
 }

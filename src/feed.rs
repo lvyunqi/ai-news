@@ -3,7 +3,7 @@ use std::io::{Cursor, Read};
 use chrono::{DateTime, NaiveDate};
 use chrono_tz::Tz;
 use regex::Regex;
-use reqwest::header::LOCATION;
+use reqwest::header::{CONTENT_TYPE, LOCATION};
 use rss::{Channel, Item};
 use url::Url;
 
@@ -24,7 +24,18 @@ pub struct Issue {
 pub trait ContentSource {
     fn fetch_rss(&self, url: &Url) -> Result<Vec<u8>, String>;
     fn fetch_markdown(&self, url: &Url) -> Result<String, String>;
-    fn fetch_image(&self, url: &Url) -> Result<Vec<u8>, String>;
+    fn fetch_image(&self, url: &Url) -> Result<ImageResponse, String>;
+}
+
+#[derive(Clone, Debug)]
+pub struct ImageResponse {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
+struct HttpResponse {
+    bytes: Vec<u8>,
+    content_type: Option<String>,
 }
 
 pub struct HttpContentSource {
@@ -49,7 +60,7 @@ impl HttpContentSource {
         limit: usize,
         max_redirects: usize,
         require_public: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<HttpResponse, String> {
         if url.scheme() != "https" {
             return Err("请求 URL 必须使用 HTTPS".to_string());
         }
@@ -80,6 +91,19 @@ impl HttpContentSource {
             .error_for_status()
             .map_err(|error| format!("服务器返回错误状态：{error}"))?;
 
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or(value)
+                    .trim()
+                    .to_ascii_lowercase()
+            });
+
         if response
             .content_length()
             .is_some_and(|size| size > limit as u64)
@@ -95,22 +119,30 @@ impl HttpContentSource {
         if bytes.len() > limit {
             return Err(format!("响应体超过 {} 字节限制", limit));
         }
-        Ok(bytes)
+        Ok(HttpResponse {
+            bytes,
+            content_type,
+        })
     }
 }
 
 impl ContentSource for HttpContentSource {
     fn fetch_rss(&self, url: &Url) -> Result<Vec<u8>, String> {
         self.fetch_bytes(url, MAX_RSS_BYTES, 5, false)
+            .map(|response| response.bytes)
     }
 
     fn fetch_markdown(&self, url: &Url) -> Result<String, String> {
-        let bytes = self.fetch_bytes(url, MAX_MARKDOWN_BYTES, 5, false)?;
-        String::from_utf8(bytes).map_err(|error| format!("Markdown 不是 UTF-8：{error}"))
+        let response = self.fetch_bytes(url, MAX_MARKDOWN_BYTES, 5, false)?;
+        String::from_utf8(response.bytes).map_err(|error| format!("Markdown 不是 UTF-8：{error}"))
     }
 
-    fn fetch_image(&self, url: &Url) -> Result<Vec<u8>, String> {
+    fn fetch_image(&self, url: &Url) -> Result<ImageResponse, String> {
         self.fetch_bytes(url, crate::media::MAX_IMAGE_BYTES, 3, true)
+            .map(|response| ImageResponse {
+                bytes: response.bytes,
+                content_type: response.content_type,
+            })
     }
 }
 
@@ -246,5 +278,90 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(issue.id, issue.page_url);
+    }
+
+    #[test]
+    fn selects_latest_pubdate_when_feed_order_is_wrong() {
+        let rss = r#"<rss version="2.0"><channel><title>AI</title>
+          <item><title>2026-08-10 morning</title><link>https://daily.juya.uk/issues/a/</link>
+            <guid>older</guid><pubDate>Mon, 10 Aug 2026 01:00:00 GMT</pubDate></item>
+          <item><title>2026-08-10 evening</title><link>https://daily.juya.uk/issues/b/</link>
+            <guid>newer</guid><pubDate>Mon, 10 Aug 2026 09:00:00 GMT</pubDate></item>
+        </channel></rss>"#;
+        let issue = parse_latest_today(
+            rss.as_bytes(),
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            chrono_tz::Asia::Shanghai,
+            &Url::parse("https://daily.juya.uk/rss.xml").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(issue.id, "newer");
+    }
+
+    #[test]
+    fn title_date_takes_priority_over_pubdate() {
+        let rss = r#"<rss version="2.0"><channel><title>AI</title><item>
+          <title>AI News 2026-08-10</title><link>https://daily.juya.uk/issues/2026-08-10/</link>
+          <guid>title-date</guid><pubDate>Tue, 11 Aug 2026 01:00:00 GMT</pubDate>
+        </item></channel></rss>"#;
+        let issue = parse_latest_today(
+            rss.as_bytes(),
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            chrono_tz::Asia::Shanghai,
+            &Url::parse("https://daily.juya.uk/rss.xml").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(issue.id, "title-date");
+    }
+
+    #[test]
+    fn pubdate_uses_configured_timezone_at_day_boundary() {
+        let rss = r#"<rss version="2.0"><channel><title>AI</title><item>
+          <title>AI News</title><link>https://daily.juya.uk/issues/boundary/</link>
+          <guid>boundary</guid><pubDate>Sun, 09 Aug 2026 16:30:00 GMT</pubDate>
+        </item></channel></rss>"#;
+        let issue = parse_latest_today(
+            rss.as_bytes(),
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            chrono_tz::Asia::Shanghai,
+            &Url::parse("https://daily.juya.uk/rss.xml").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(issue.date, NaiveDate::from_ymd_opt(2026, 8, 10).unwrap());
+    }
+
+    #[test]
+    fn skips_item_without_guid_or_link() {
+        let rss = r#"<rss version="2.0"><channel><title>AI</title><item>
+          <title>2026-08-10</title><pubDate>Mon, 10 Aug 2026 01:00:00 GMT</pubDate>
+        </item></channel></rss>"#;
+        let issue = parse_latest_today(
+            rss.as_bytes(),
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            chrono_tz::Asia::Shanghai,
+            &Url::parse("https://daily.juya.uk/rss.xml").unwrap(),
+        )
+        .unwrap();
+
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_xml() {
+        let error = parse_latest_today(
+            b"<rss><channel>",
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            chrono_tz::Asia::Shanghai,
+            &Url::parse("https://daily.juya.uk/rss.xml").unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("RSS XML 解析失败"));
     }
 }

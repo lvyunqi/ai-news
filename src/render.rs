@@ -14,6 +14,10 @@ static IMAGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\((https?://[^)]+)\)").expect("valid image regex"));
 static HTML_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid html regex"));
+static BLOCKED_HTML_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<(?:script|style|iframe)\b[^>]*>.*?</(?:script|style|iframe)\s*>")
+        .expect("valid blocked html regex")
+});
 static CODE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"`([^`]*)`").expect("valid code regex"));
 static ISSUE_NUMBER_RE: LazyLock<Regex> =
@@ -118,16 +122,25 @@ fn extract_plain_overview(markdown: &str) -> Option<String> {
 }
 
 fn render_qq_markdown(issue: &Issue, markdown: Option<&str>, fallback: &str) -> String {
-    let source = markdown.unwrap_or(fallback);
-    let normalized = normalize_qq_markdown(source);
     let page_url = full_page_url(issue);
-    let result = if normalized.trim().is_empty() {
-        format!(
-            "# AI 早报 {}\n\n今日早报已发布。\n\n[查看网页全文]({page_url})",
+    let normalized = normalize_qq_markdown(markdown.unwrap_or(fallback));
+    let result = match markdown {
+        None => {
+            let body = if normalized.trim().is_empty() {
+                "今日早报已发布。"
+            } else {
+                normalized.trim()
+            };
+            format!(
+                "# AI 早报 {}\n\n{body}\n\n[查看网页全文]({page_url})\n\n**提示**：内容由 AI 辅助创作，可能存在幻觉和错误。",
+                issue.date.format("%Y-%m-%d")
+            )
+        }
+        Some(_) if normalized.trim().is_empty() => format!(
+            "# AI 早报 {}\n\n今日早报已发布。\n\n[查看网页全文]({page_url})\n\n**提示**：内容由 AI 辅助创作，可能存在幻觉和错误。",
             issue.date.format("%Y-%m-%d")
-        )
-    } else {
-        normalized
+        ),
+        Some(_) => normalized,
     };
 
     if char_count(&result) <= QQ_MARKDOWN_MAX_CHARS {
@@ -137,19 +150,26 @@ fn render_qq_markdown(issue: &Issue, markdown: Option<&str>, fallback: &str) -> 
     let overview = markdown
         .and_then(extract_markdown_overview)
         .unwrap_or_else(|| truncate_at_line(fallback, 8000));
-    let compact = format!(
-        "# AI 早报 {}\n\n{}\n\n[查看网页全文]({page_url})\n\n**提示**：内容由 AI 辅助创作，可能存在幻觉和错误。",
-        issue.date.format("%Y-%m-%d"),
-        normalize_qq_markdown(&overview).trim()
+    let header = format!("# AI 早报 {}\n\n", issue.date.format("%Y-%m-%d"));
+    let footer = format!(
+        "\n\n[查看网页全文]({page_url})\n\n**提示**：内容由 AI 辅助创作，可能存在幻觉和错误。"
     );
-    truncate_at_line(&compact, QQ_MARKDOWN_MAX_CHARS)
+    let available = QQ_MARKDOWN_MAX_CHARS.saturating_sub(char_count(&header) + char_count(&footer));
+    let overview = truncate_at_line(normalize_qq_markdown(&overview).trim(), available);
+    format!("{header}{overview}{footer}")
 }
 
 fn normalize_qq_markdown(source: &str) -> String {
     let mut output = Vec::new();
     let mut previous_blank = true;
+    let mut in_code_fence = false;
+    let source = BLOCKED_HTML_RE.replace_all(source, "");
     for raw_line in source.lines() {
         let mut line = raw_line.trim_end().to_string();
+        if line.trim_start().starts_with("```") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
         if line.trim().is_empty() {
             if !previous_blank {
                 output.push(String::new());
@@ -198,7 +218,11 @@ fn normalize_qq_markdown(source: &str) -> String {
         if (line.starts_with("- ") || line.starts_with("1. ")) && !previous_blank {
             output.push(String::new());
         }
-        output.push(line);
+        if in_code_fence {
+            output.push(clean_inline(&line));
+        } else {
+            output.push(line);
+        }
         previous_blank = false;
     }
     output.join("\n").trim().to_string()
@@ -259,6 +283,9 @@ fn is_http_url(value: &str) -> bool {
 }
 
 fn is_safe_http_url(value: &str) -> bool {
+    if value.chars().any(is_disallowed_url_char) {
+        return false;
+    }
     Url::parse(value).ok().is_some_and(|url| {
         matches!(url.scheme(), "http" | "https")
             && url.username().is_empty()
@@ -267,6 +294,9 @@ fn is_safe_http_url(value: &str) -> bool {
 }
 
 pub fn is_public_https_url(value: &str) -> bool {
+    if value.chars().any(is_disallowed_url_char) {
+        return false;
+    }
     let Ok(url) = Url::parse(value) else {
         return false;
     };
@@ -296,6 +326,18 @@ pub fn is_public_https_url(value: &str) -> bool {
         Some(url::Host::Domain(_)) => true,
         None => false,
     }
+}
+
+fn is_disallowed_url_char(value: char) -> bool {
+    value.is_control()
+        || matches!(
+            value,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 fn truncate_at_line(value: &str, max_chars: usize) -> String {
@@ -395,5 +437,65 @@ mod tests {
         assert!(normalized.contains("[safe](https://example.com)"));
         assert!(!normalized.contains("javascript:"));
         assert!(!normalized.contains("u:p@"));
+    }
+
+    #[test]
+    fn qq_fallback_keeps_title_link_and_disclaimer() {
+        let content = prepare(&issue(), None);
+
+        assert!(content.qq_markdown.starts_with("# AI 早报 2026-08-10"));
+        assert!(content.qq_markdown.contains("fallback"));
+        assert!(content.qq_markdown.contains("[查看网页全文]"));
+        assert!(content.qq_markdown.contains("AI 辅助创作"));
+    }
+
+    #[test]
+    fn empty_content_uses_stable_fallbacks() {
+        let mut empty_issue = issue();
+        empty_issue.description.clear();
+        let content = prepare(&empty_issue, None);
+
+        assert!(content.onebot_text.contains("今日早报已发布。"));
+        assert!(content.qq_markdown.contains("今日早报已发布。"));
+        assert!(content.onebot_text.contains("查看全文"));
+        assert!(content.qq_markdown.contains("查看网页全文"));
+    }
+
+    #[test]
+    fn long_outputs_keep_required_footers_within_limits() {
+        let items = (0..1000)
+            .map(|index| format!("- 新闻 {index} [↗](https://example.com/{index}) `#{index}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let markdown = format!(
+            "# AI 早报\n\n## 概览\n### 分类\n{items}\n\n---\n\n{}",
+            "正文\n".repeat(13_000)
+        );
+        let content = prepare(&issue(), Some(&markdown));
+
+        assert!(char_count(&content.onebot_text) <= ONEBOT_MAX_CHARS);
+        assert!(content.onebot_text.contains("查看全文"));
+        assert!(
+            content
+                .onebot_text
+                .ends_with("内容由 AI 辅助创作，请注意核实。")
+        );
+        assert!(char_count(&content.qq_markdown) <= QQ_MARKDOWN_MAX_CHARS);
+        assert!(content.qq_markdown.contains("查看网页全文"));
+        assert!(content.qq_markdown.contains("AI 辅助创作"));
+    }
+
+    #[test]
+    fn removes_blocked_html_code_fences_and_direction_controls() {
+        let source = "<script>alert('secret')</script>\n<style>.x{}</style>\n<iframe>hidden</iframe>\n```rust\nlet x = 1;\n```\n[safe](https://example.com)\n[hidden](https://exa\u{202e}mple.com)";
+        let normalized = normalize_qq_markdown(source);
+
+        assert!(!normalized.contains("alert"));
+        assert!(!normalized.contains(".x"));
+        assert!(!normalized.contains("hidden</"));
+        assert!(!normalized.contains("```"));
+        assert!(normalized.contains("let x = 1;"));
+        assert!(normalized.contains("[safe](https://example.com)"));
+        assert!(!normalized.contains('\u{202e}'));
     }
 }

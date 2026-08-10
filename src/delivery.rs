@@ -71,11 +71,31 @@ mod tests {
 
     #[test]
     fn official_payload_has_only_one_markdown_segment() {
+        let markdown = r#"# Title
+content "quoted"\path"#;
         let value: serde_json::Value =
-            serde_json::from_str(&official_segments_json("# Title\ncontent")).unwrap();
+            serde_json::from_str(&official_segments_json(markdown)).unwrap();
         let segments = value.as_array().unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0]["type"], "markdown");
-        assert_eq!(segments[0]["data"]["content"], "# Title\ncontent");
+        assert_eq!(segments[0]["data"]["content"], markdown);
+        assert!(segments[0].get("text").is_none());
+    }
+
+    #[test]
+    fn every_enqueue_status_has_a_stable_name() {
+        let cases = [
+            (SendEnqueueStatus::Accepted, "Accepted"),
+            (SendEnqueueStatus::HostUnavailable, "HostUnavailable"),
+            (SendEnqueueStatus::InvalidRequest, "InvalidRequest"),
+            (SendEnqueueStatus::BotNotFound, "BotNotFound"),
+            (SendEnqueueStatus::BotDisabled, "BotDisabled"),
+            (SendEnqueueStatus::QueueFull, "QueueFull"),
+            (SendEnqueueStatus::HostShuttingDown, "HostShuttingDown"),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(status_name(status), expected);
+        }
     }
 }
