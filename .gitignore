@@ -1,0 +1,12 @@
+/target/
+*.dll
+*.dylib
+*.so
+*.log
+*.db
+delivery-state.json
+delivery-state.json.*
+config/plugins/*.toml
+plugins/bin/
+.idea/
+.vscode/

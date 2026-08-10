@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI 早报推送",
+  "description": "轮询橘鸦 AI 早报，并通过 OneBot 11 或 QQ 官方机器人主动推送到群聊。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "enabled",
+    "feed_url",
+    "timezone",
+    "poll_interval_minutes",
+    "request_timeout_seconds",
+    "targets"
+  ],
+  "properties": {
+    "enabled": {
+      "title": "启用自动推送",
+      "description": "关闭后插件仍可加载并响应状态命令，但不会访问网络。",
+      "type": "boolean",
+      "default": false
+    },
+    "feed_url": {
+      "title": "RSS 地址",
+      "description": "v1 只保证兼容橘鸦 AI 早报的 RSS 结构，必须使用 HTTPS。",
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://",
+      "maxLength": 2048,
+      "default": "https://daily.juya.uk/rss.xml"
+    },
+    "timezone": {
+      "title": "日期时区",
+      "description": "用于判断 RSS 期号是否属于今天，填写 IANA 时区。",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "default": "Asia/Shanghai"
+    },
+    "poll_interval_minutes": {
+      "title": "轮询间隔",
+      "description": "抓取失败后等待下一个正常轮询周期，不进行紧密重试。",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1440,
+      "default": 5
+    },
+    "request_timeout_seconds": {
+      "title": "请求超时",
+      "description": "RSS、Markdown 和封面请求的总超时保护值。",
+      "type": "integer",
+      "minimum": 3,
+      "maximum": 60,
+      "default": 15
+    },
+    "targets": {
+      "title": "推送目标",
+      "description": "按数组顺序串行处理，最多 50 个目标。",
+      "type": "array",
+      "maxItems": 50,
+      "default": [],
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/onebotTarget"
+          },
+          {
+            "$ref": "#/$defs/qqOfficialTarget"
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "commonTargetProperties": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "title": "目标名称",
+          "description": "用于管理面板和日志显示，不参与路由。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "enabled": {
+          "title": "启用目标",
+          "type": "boolean",
+          "default": true
+        },
+        "account_id": {
+          "title": "机器人稳定账号",
+          "description": "匹配 QimenBot 宿主 [[bots]].account_id。OneBot 通常填写 self_id，官方机器人建议填写 AppID。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "group_id": {
+          "title": "目标群标识",
+          "description": "OneBot 填普通群号；QQ 官方机器人填 group_openid。始终按字符串保存。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "onebotTarget": {
+      "title": "OneBot 11 群",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "enabled",
+        "protocol",
+        "account_id",
+        "group_id",
+        "image_mode"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/commonTargetProperties/properties/name"
+        },
+        "enabled": {
+          "$ref": "#/$defs/commonTargetProperties/properties/enabled"
+        },
+        "protocol": {
+          "title": "协议",
+          "const": "onebot11"
+        },
+        "account_id": {
+          "$ref": "#/$defs/commonTargetProperties/properties/account_id"
+        },
+        "group_id": {
+          "$ref": "#/$defs/commonTargetProperties/properties/group_id"
+        },
+        "image_mode": {
+          "title": "图片模式",
+          "description": "封面失败时仍发送纯文本概览。",
+          "type": "string",
+          "enum": [
+            "none",
+            "cover"
+          ],
+          "default": "cover"
+        }
+      }
+    },
+    "qqOfficialTarget": {
+      "title": "QQ 官方机器人群",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "enabled",
+        "protocol",
+        "account_id",
+        "group_id"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/commonTargetProperties/properties/name"
+        },
+        "enabled": {
+          "$ref": "#/$defs/commonTargetProperties/properties/enabled"
+        },
+        "protocol": {
+          "title": "协议",
+          "const": "qq-official"
+        },
+        "account_id": {
+          "$ref": "#/$defs/commonTargetProperties/properties/account_id"
+        },
+        "group_id": {
+          "title": "目标 group_openid",
+          "description": "必须填写 QQ 开放平台提供的 group_openid，不是普通 QQ 群号。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    }
+  }
+}

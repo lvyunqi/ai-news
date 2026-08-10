@@ -1,0 +1,40 @@
+{
+  "": {
+    "ui:order": [
+      "enabled",
+      "feed_url",
+      "timezone",
+      "poll_interval_minutes",
+      "request_timeout_seconds",
+      "targets"
+    ]
+  },
+  "/poll_interval_minutes": {
+    "unit": "分钟",
+    "step": 1
+  },
+  "/request_timeout_seconds": {
+    "unit": "秒",
+    "step": 1
+  },
+  "/targets": {
+    "itemTitle": "name",
+    "itemLabel": "推送目标",
+    "addLabel": "添加目标",
+    "collapsible": true
+  },
+  "/targets/*/protocol": {
+    "ui:widget": "badges",
+    "labels": {
+      "onebot11": "OneBot 11",
+      "qq-official": "QQ 官方机器人"
+    }
+  },
+  "/targets/*/image_mode": {
+    "ui:widget": "badges",
+    "labels": {
+      "none": "不发送图片",
+      "cover": "发送封面"
+    }
+  }
+}

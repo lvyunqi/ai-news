@@ -1,0 +1,20 @@
+enabled = true
+feed_url = "https://daily.juya.uk/rss.xml"
+timezone = "Asia/Shanghai"
+poll_interval_minutes = 5
+request_timeout_seconds = 15
+
+[[targets]]
+name = "OneBot AI 群"
+enabled = true
+protocol = "onebot11"
+account_id = "2733944636"
+group_id = "123456789"
+image_mode = "cover"
+
+[[targets]]
+name = "官方机器人 AI 群"
+enabled = true
+protocol = "qq-official"
+account_id = "102012345"
+group_id = "replace-with-group-openid"
