@@ -76,7 +76,7 @@ jobs:
             min_glibc = $null
           } | ConvertTo-Json | Set-Content -LiteralPath "ci-evidence/$env:TARGET.json" -Encoding utf8
           Write-Output "::notice file=Cargo.toml,title=Windows target evidence::target=$env:TARGET size_bytes=$size sha256=$hash"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ci-evidence-${{ env.TARGET }}
           path: ci-evidence/*
@@ -126,7 +126,7 @@ jobs:
           printf '{\n  "target": "%s",\n  "size_bytes": %s,\n  "sha256": "%s",\n  "min_glibc": "%s"\n}\n' \
             "$TARGET" "$size" "$sha256" "$min_glibc" > "ci-evidence/$TARGET.json"
           echo "::notice file=Cargo.toml,title=Linux target evidence::target=$TARGET size_bytes=$size sha256=$sha256 min_glibc=$min_glibc"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ci-evidence-${{ env.TARGET }}
           path: ci-evidence/*

@@ -65,7 +65,7 @@ jobs:
             sha256 = $hash
             min_glibc = $null
           } | ConvertTo-Json | Set-Content -LiteralPath "$asset.json" -Encoding utf8
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.TARGET }}
           path: dist/*
@@ -116,7 +116,7 @@ jobs:
           file "$asset"
           ldd "$asset"
           readelf --version-info "$asset" > "$asset.readelf.txt"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.TARGET }}
           path: dist/*
