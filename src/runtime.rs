@@ -468,6 +468,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeSource {
+        rss_body: Option<String>,
         rss_calls: AtomicUsize,
         markdown_calls: AtomicUsize,
         image_calls: AtomicUsize,
@@ -476,7 +477,7 @@ mod tests {
     impl ContentSource for FakeSource {
         fn fetch_rss(&self, _url: &Url) -> Result<Vec<u8>, String> {
             self.rss_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(RSS.as_bytes().to_vec())
+            Ok(self.rss_body.as_deref().unwrap_or(RSS).as_bytes().to_vec())
         }
 
         fn fetch_markdown(&self, _url: &Url) -> Result<String, String> {
@@ -657,6 +658,46 @@ mod tests {
     }
 
     #[test]
+    fn two_official_targets_each_receive_one_markdown_attempt() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let source = FakeSource::default();
+        let sender = FakeSender::accepted();
+        let mut config = config();
+        config.targets = vec![
+            target("official-a", Protocol::QqOfficial, "app-a", "openid-a"),
+            target("official-b", Protocol::QqOfficial, "app-b", "openid-b"),
+        ];
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+
+        let result = run_poll(
+            &config,
+            dir.path(),
+            &source,
+            &sender,
+            &mut state,
+            Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(result.accepted, 2);
+        let calls = sender.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.protocol == Protocol::QqOfficial)
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.qq_markdown.starts_with("![早报配图]"))
+        );
+        assert_eq!(source.image_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn non_accepted_targets_are_not_persisted_and_later_targets_continue() {
         let _guard = test_guard();
         let dir = tempfile::tempdir().unwrap();
@@ -693,6 +734,77 @@ mod tests {
         assert!(!state.contains("onebot11|bot-2|group-2", "issue-1"));
         assert!(state.contains("qq-official|app|group-openid", "issue-1"));
         assert_eq!(result.targets[2].status, "宿主已接收入队");
+    }
+
+    #[test]
+    fn first_accepted_second_failed_persists_only_first_target() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let source = FakeSource::default();
+        let sender = FakeSender::scripted(vec![
+            SendEnqueueStatus::Accepted,
+            SendEnqueueStatus::QueueFull,
+        ]);
+        let mut config = config();
+        config.targets = vec![
+            target("ok", Protocol::OneBot11, "bot-ok", "group-ok"),
+            target("full", Protocol::OneBot11, "bot-full", "group-full"),
+        ];
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+
+        let result = run_poll(
+            &config,
+            dir.path(),
+            &source,
+            &sender,
+            &mut state,
+            Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.failed, 1);
+        assert!(state.contains("onebot11|bot-ok|group-ok", "issue-1"));
+        assert!(!state.contains("onebot11|bot-full|group-full", "issue-1"));
+    }
+
+    #[test]
+    fn new_issue_id_is_sent_again_to_same_target() {
+        let _guard = test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let first_source = FakeSource::default();
+        let second_source = FakeSource {
+            rss_body: Some(RSS.replace("issue-1", "issue-2")),
+            ..FakeSource::default()
+        };
+        let sender = FakeSender::accepted();
+        let mut state = DeliveryState::load(dir.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
+
+        run_poll(
+            &config(),
+            dir.path(),
+            &first_source,
+            &sender,
+            &mut state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        run_poll(
+            &config(),
+            dir.path(),
+            &second_source,
+            &sender,
+            &mut state,
+            now,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(sender.calls.lock().unwrap().len(), 2);
+        assert!(state.contains("onebot11|bot|group", "issue-2"));
     }
 
     #[test]
@@ -864,6 +976,31 @@ mod tests {
         assert!(!output.contains("target-8"));
         assert!(output.contains("其余 2 个目标已省略"));
         assert!(!output.contains("Accepted"));
+    }
+
+    #[test]
+    fn status_is_stable_for_default_disabled_and_empty_target_states() {
+        let _guard = test_guard();
+        replace_status(StatusSnapshot::default());
+        let default_output = status_text();
+        assert!(default_output.contains("配置：关闭"));
+        assert!(default_output.contains("尚未轮询"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut disabled = config();
+        disabled.enabled = false;
+        disabled.targets.clear();
+        start(disabled, dir.path().to_path_buf()).unwrap();
+        let disabled_output = status_text();
+        assert!(disabled_output.contains("插件配置为关闭"));
+        assert!(disabled_output.contains("启用 0/配置 0"));
+
+        let mut empty = config();
+        empty.targets.clear();
+        start(empty, dir.path().to_path_buf()).unwrap();
+        let empty_output = status_text();
+        assert!(empty_output.contains("没有启用的推送目标"));
+        stop().unwrap();
     }
 
     #[test]

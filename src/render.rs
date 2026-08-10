@@ -310,22 +310,34 @@ pub fn is_public_https_url(value: &str) -> bool {
         return false;
     }
     match url.host() {
-        Some(url::Host::Ipv4(ip)) => {
-            !(ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_unspecified())
-        }
+        Some(url::Host::Ipv4(ip)) => !is_blocked_ipv4(ip),
         Some(url::Host::Ipv6(ip)) => {
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
-                || ip.is_unicast_link_local())
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+                || matches!(ip.segments(), [0x2001, 0x0db8, ..]))
         }
         Some(url::Host::Domain(_)) => true,
         None => false,
     }
+}
+
+fn is_blocked_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+        || octets[0] >= 240
 }
 
 fn is_disallowed_url_char(value: char) -> bool {
@@ -427,6 +439,11 @@ mod tests {
         assert!(!is_public_https_url("http://assets.juya.uk/a.png"));
         assert!(!is_public_https_url("https://127.0.0.1/a.png"));
         assert!(!is_public_https_url("https://localhost/a.png"));
+        assert!(!is_public_https_url("https://224.0.0.1/a.png"));
+        assert!(!is_public_https_url("https://240.0.0.1/a.png"));
+        assert!(!is_public_https_url("https://192.0.2.1/a.png"));
+        assert!(!is_public_https_url("https://[ff02::1]/a.png"));
+        assert!(!is_public_https_url("https://[2001:db8::1]/a.png"));
     }
 
     #[test]
@@ -437,6 +454,17 @@ mod tests {
         assert!(normalized.contains("[safe](https://example.com)"));
         assert!(!normalized.contains("javascript:"));
         assert!(!normalized.contains("u:p@"));
+    }
+
+    #[test]
+    fn keeps_only_public_https_markdown_images() {
+        let normalized = normalize_qq_markdown(
+            "![http](http://example.com/a.png)\n![private](https://127.0.0.1/a.png)\n![public](https://example.com/a.png)",
+        );
+
+        assert!(!normalized.contains("http://example.com/a.png"));
+        assert!(!normalized.contains("127.0.0.1"));
+        assert!(normalized.contains("![public](https://example.com/a.png)"));
     }
 
     #[test]
