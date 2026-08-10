@@ -1,6 +1,7 @@
 use std::sync::LazyLock;
 
-use regex::{Captures, Regex};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use regex::Regex;
 use url::Url;
 
 use crate::feed::Issue;
@@ -8,18 +9,12 @@ use crate::feed::Issue;
 const ONEBOT_MAX_CHARS: usize = 3500;
 const QQ_MARKDOWN_MAX_CHARS: usize = 12_000;
 
-static LINK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").expect("valid link regex"));
-static IMAGE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\((https?://[^)]+)\)").expect("valid image regex"));
-static HTML_RE: LazyLock<Regex> =
+static HTML_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid html regex"));
 static BLOCKED_HTML_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)<(?:script|style|iframe)\b[^>]*>.*?</(?:script|style|iframe)\s*>")
         .expect("valid blocked html regex")
 });
-static CODE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"`([^`]*)`").expect("valid code regex"));
 static ISSUE_NUMBER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s*#\d+\s*$").expect("valid issue number regex"));
 
@@ -60,61 +55,92 @@ fn render_onebot(issue: &Issue, markdown: Option<&str>, fallback: &str) -> Strin
 }
 
 fn extract_plain_overview(markdown: &str) -> Option<String> {
+    #[derive(Default)]
+    struct PlainItem {
+        text: String,
+        urls: Vec<String>,
+    }
+
     let mut in_overview = false;
     let mut output = Vec::new();
-    for raw_line in markdown.lines() {
-        let line = raw_line.trim();
-        if line == "## 概览" {
-            in_overview = true;
-            continue;
-        }
-        if !in_overview {
-            continue;
-        }
-        if line == "---" || line == "***" {
-            break;
-        }
-        if let Some(category) = line.strip_prefix("### ") {
-            if !output.is_empty()
-                && output
-                    .last()
-                    .is_some_and(|value: &String| !value.is_empty())
-            {
-                output.push(String::new());
-            }
-            output.push(clean_inline(category));
-            continue;
-        }
-        let Some(item) = line.strip_prefix("- ") else {
-            continue;
-        };
+    let mut heading: Option<(HeadingLevel, String)> = None;
+    let mut item: Option<PlainItem> = None;
+    let mut link_stack = Vec::<Option<String>>::new();
+    let mut image_depth = 0_usize;
 
-        let mut urls = Vec::new();
-        let visible = LINK_RE
-            .replace_all(item, |captures: &Captures<'_>| {
-                let label = captures.get(1).map_or("", |value| value.as_str());
-                let url = captures.get(2).map_or("", |value| value.as_str());
-                if is_http_url(url) {
-                    urls.push(url.to_string());
+    for event in markdown_parser(markdown) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                heading = Some((level, String::new()));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, text)) = heading.take() {
+                    let text = clean_inline(&text);
+                    if level == HeadingLevel::H2 && text == "概览" {
+                        in_overview = true;
+                    } else if in_overview && level == HeadingLevel::H3 && !text.is_empty() {
+                        if !output.is_empty()
+                            && output
+                                .last()
+                                .is_some_and(|value: &String| !value.is_empty())
+                        {
+                            output.push(String::new());
+                        }
+                        output.push(text);
+                    }
                 }
-                if label == "↗" {
-                    String::new()
-                } else {
-                    label.to_string()
+            }
+            Event::Start(Tag::Item) if in_overview => {
+                item = Some(PlainItem::default());
+            }
+            Event::End(TagEnd::Item) if in_overview => {
+                if let Some(mut item) = item.take() {
+                    let visible = ISSUE_NUMBER_RE
+                        .replace(&clean_inline(&item.text), "")
+                        .trim()
+                        .to_string();
+                    if !visible.is_empty() {
+                        output.push(format!("- {visible}"));
+                    }
+                    item.urls.sort();
+                    item.urls.dedup();
+                    output.extend(item.urls.into_iter().map(|url| format!("  {url}")));
                 }
-            })
-            .to_string();
-        let visible = ISSUE_NUMBER_RE
-            .replace(&clean_inline(&visible), "")
-            .trim()
-            .to_string();
-        if !visible.is_empty() {
-            output.push(format!("- {visible}"));
-        }
-        urls.sort();
-        urls.dedup();
-        for url in urls {
-            output.push(format!("  {url}"));
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                let url = is_safe_http_url(dest_url.as_ref()).then(|| dest_url.to_string());
+                if let (Some(item), Some(url)) = (item.as_mut(), url.as_ref()) {
+                    item.urls.push(url.clone());
+                }
+                link_stack.push(url);
+            }
+            Event::End(TagEnd::Link) => {
+                link_stack.pop();
+            }
+            Event::Start(Tag::Image { .. }) => {
+                image_depth += 1;
+            }
+            Event::End(TagEnd::Image) => {
+                image_depth = image_depth.saturating_sub(1);
+            }
+            Event::Text(text) | Event::Code(text) if image_depth == 0 => {
+                if let Some((_, heading)) = heading.as_mut() {
+                    heading.push_str(&text);
+                } else if let Some(item) = item.as_mut()
+                    && (link_stack.is_empty() || text.trim() != "↗")
+                {
+                    item.text.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak if image_depth == 0 => {
+                if let Some((_, heading)) = heading.as_mut() {
+                    heading.push(' ');
+                } else if let Some(item) = item.as_mut() {
+                    item.text.push(' ');
+                }
+            }
+            Event::Rule if in_overview => break,
+            _ => {}
         }
     }
 
@@ -160,104 +186,306 @@ fn render_qq_markdown(issue: &Issue, markdown: Option<&str>, fallback: &str) -> 
 }
 
 fn normalize_qq_markdown(source: &str) -> String {
-    let mut output = Vec::new();
-    let mut previous_blank = true;
-    let mut in_code_fence = false;
+    let mut writer = QqMarkdownWriter::default();
     let source = BLOCKED_HTML_RE.replace_all(source, "");
-    for raw_line in source.lines() {
-        let mut line = raw_line.trim_end().to_string();
-        if line.trim_start().starts_with("```") {
-            in_code_fence = !in_code_fence;
-            continue;
-        }
-        if line.trim().is_empty() {
-            if !previous_blank {
-                output.push(String::new());
-            }
-            previous_blank = true;
-            continue;
-        }
-
-        line = HTML_RE.replace_all(&line, "").to_string();
-        line = CODE_RE.replace_all(&line, "$1").to_string();
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(heading) = line.strip_prefix("### ") {
-            line = format!("**{}**", heading.trim());
-        } else if line.trim() == "---" {
-            line = "***".to_string();
-        }
-
-        line = IMAGE_RE
-            .replace_all(&line, |captures: &Captures<'_>| {
-                let alt = captures.get(1).map_or("", |value| value.as_str()).trim();
-                let url = captures.get(2).map_or("", |value| value.as_str());
-                if is_public_https_url(url) {
-                    format!(
-                        "![{}]({url})",
-                        if alt.is_empty() { "早报配图" } else { alt }
-                    )
-                } else {
-                    String::new()
-                }
-            })
-            .to_string();
-        line = LINK_RE
-            .replace_all(&line, |captures: &Captures<'_>| {
-                let label = captures.get(1).map_or("", |value| value.as_str());
-                let url = captures.get(2).map_or("", |value| value.as_str());
-                if is_safe_http_url(url) {
-                    format!("[{label}]({url})")
-                } else {
-                    label.to_string()
-                }
-            })
-            .to_string();
-
-        if (line.starts_with("- ") || line.starts_with("1. ")) && !previous_blank {
-            output.push(String::new());
-        }
-        if in_code_fence {
-            output.push(clean_inline(&line));
-        } else {
-            output.push(line);
-        }
-        previous_blank = false;
+    for event in markdown_parser(&source) {
+        writer.event(event);
     }
-    output.join("\n").trim().to_string()
+    writer.finish()
 }
 
 fn extract_markdown_overview(markdown: &str) -> Option<String> {
-    let mut output = Vec::new();
-    let mut in_overview = false;
-    for line in markdown.lines() {
-        if line.trim() == "## 概览" {
-            in_overview = true;
-            output.push(line.to_string());
-            continue;
-        }
-        if in_overview && matches!(line.trim(), "---" | "***") {
-            break;
-        }
-        if in_overview {
-            output.push(line.to_string());
+    let mut heading: Option<(HeadingLevel, usize, String)> = None;
+    let mut overview_start = None;
+
+    for (event, range) in markdown_parser(markdown).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                heading = Some((level, range.start, String::new()));
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, _, heading)) = heading.as_mut() {
+                    heading.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, start, text)) = heading.take()
+                    && level == HeadingLevel::H2
+                    && clean_inline(&text) == "概览"
+                {
+                    overview_start = Some(start);
+                }
+            }
+            Event::Rule => {
+                if let Some(start) = overview_start {
+                    return markdown
+                        .get(start..range.start)
+                        .map(str::trim)
+                        .map(str::to_string);
+                }
+            }
+            _ => {}
         }
     }
-    (!output.is_empty()).then(|| output.join("\n"))
+
+    overview_start.and_then(|start| markdown.get(start..).map(str::trim).map(str::to_string))
 }
 
 fn first_public_image(markdown: &str) -> Option<Url> {
-    IMAGE_RE.captures_iter(markdown).find_map(|captures| {
-        let value = captures.get(2)?.as_str();
-        is_public_https_url(value)
-            .then(|| Url::parse(value).ok())
-            .flatten()
+    markdown_parser(markdown).find_map(|event| match event {
+        Event::Start(Tag::Image { dest_url, .. }) if is_public_https_url(dest_url.as_ref()) => {
+            Url::parse(dest_url.as_ref()).ok()
+        }
+        _ => None,
     })
 }
 
+fn markdown_parser(source: &str) -> Parser<'_> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    Parser::new_ext(source, options)
+}
+
+#[derive(Default)]
+struct QqMarkdownWriter {
+    output: String,
+    list_stack: Vec<ListState>,
+    link_stack: Vec<Option<String>>,
+    image_stack: Vec<ImageState>,
+    quote_depth: usize,
+    item_depth: usize,
+    code_block_depth: usize,
+}
+
+struct ListState {
+    next: Option<u64>,
+}
+
+struct ImageState {
+    url: Option<String>,
+    alt: String,
+}
+
+impl QqMarkdownWriter {
+    fn event(&mut self, event: Event<'_>) {
+        if let Some(image) = self.image_stack.last_mut() {
+            match event {
+                Event::Text(text) | Event::Code(text) => image.alt.push_str(&text),
+                Event::End(TagEnd::Image) => {
+                    let image = self.image_stack.pop().expect("image stack");
+                    if let Some(url) = image.url {
+                        let alt = clean_inline(&image.alt);
+                        self.write(&format!(
+                            "![{}]({url})",
+                            if alt.is_empty() { "早报配图" } else { &alt }
+                        ));
+                    }
+                }
+                Event::Start(Tag::Image { dest_url, .. }) => {
+                    self.image_stack.push(ImageState {
+                        url: is_public_https_url(dest_url.as_ref()).then(|| dest_url.to_string()),
+                        alt: String::new(),
+                    });
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match event {
+            Event::Start(tag) => self.start_tag(tag),
+            Event::End(tag) => self.end_tag(tag),
+            Event::Text(text) | Event::Code(text) => self.write(&sanitize_visible_text(&text)),
+            Event::Html(_) | Event::InlineHtml(_) => {}
+            Event::SoftBreak | Event::HardBreak => self.write("\n"),
+            Event::Rule => {
+                self.ensure_blank_line();
+                self.write("***");
+                self.ensure_blank_line();
+            }
+            Event::FootnoteReference(name) => self.write(&sanitize_visible_text(&name)),
+            Event::TaskListMarker(_) => {}
+            _ => {}
+        }
+    }
+
+    fn start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph if self.item_depth == 0 => {
+                self.ensure_blank_line();
+            }
+            Tag::Heading { level, .. } => {
+                self.ensure_blank_line();
+                self.write(match level {
+                    HeadingLevel::H1 => "# ",
+                    HeadingLevel::H2 => "## ",
+                    _ => "**",
+                });
+            }
+            Tag::BlockQuote(_) => {
+                self.ensure_blank_line();
+                self.quote_depth += 1;
+            }
+            Tag::CodeBlock(_) => {
+                self.ensure_blank_line();
+                self.code_block_depth += 1;
+            }
+            Tag::List(start) => {
+                self.ensure_blank_line();
+                self.list_stack.push(ListState { next: start });
+            }
+            Tag::Item => {
+                self.ensure_line_start();
+                let indent = "  ".repeat(self.list_stack.len().saturating_sub(1));
+                self.write(&indent);
+                let prefix = self
+                    .list_stack
+                    .last_mut()
+                    .and_then(|list| list.next.as_mut())
+                    .map(|next| {
+                        let prefix = format!("{next}. ");
+                        *next += 1;
+                        prefix
+                    })
+                    .unwrap_or_else(|| "- ".to_string());
+                self.write(&prefix);
+                self.item_depth += 1;
+            }
+            Tag::Emphasis => self.write("_"),
+            Tag::Strong => self.write("**"),
+            Tag::Strikethrough => self.write("~~"),
+            Tag::Link { dest_url, .. } => {
+                let url = is_safe_http_url(dest_url.as_ref()).then(|| dest_url.to_string());
+                if url.is_some() {
+                    self.write("[");
+                }
+                self.link_stack.push(url);
+            }
+            Tag::Image { dest_url, .. } => {
+                self.image_stack.push(ImageState {
+                    url: is_public_https_url(dest_url.as_ref()).then(|| dest_url.to_string()),
+                    alt: String::new(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph if self.item_depth == 0 => {
+                self.ensure_blank_line();
+            }
+            TagEnd::Heading(level) => {
+                if !matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                    self.write("**");
+                }
+                self.ensure_blank_line();
+            }
+            TagEnd::BlockQuote(_) => {
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+                self.ensure_blank_line();
+            }
+            TagEnd::CodeBlock => {
+                self.code_block_depth = self.code_block_depth.saturating_sub(1);
+                self.ensure_blank_line();
+            }
+            TagEnd::List(_) => {
+                self.list_stack.pop();
+                self.ensure_blank_line();
+            }
+            TagEnd::Item => {
+                self.item_depth = self.item_depth.saturating_sub(1);
+                self.ensure_line_start();
+            }
+            TagEnd::Emphasis => self.write("_"),
+            TagEnd::Strong => self.write("**"),
+            TagEnd::Strikethrough => self.write("~~"),
+            TagEnd::Link => {
+                if let Some(Some(url)) = self.link_stack.pop() {
+                    self.write(&format!("]({url})"));
+                }
+            }
+            TagEnd::Image => {}
+            _ => {}
+        }
+    }
+
+    fn write(&mut self, value: &str) {
+        for character in value.chars() {
+            if self.at_line_start() && self.quote_depth > 0 && character != '\n' {
+                self.output.push_str(&"> ".repeat(self.quote_depth));
+            }
+            self.output.push(character);
+        }
+    }
+
+    fn ensure_line_start(&mut self) {
+        if !self.output.is_empty() && !self.output.ends_with('\n') {
+            self.output.push('\n');
+        }
+    }
+
+    fn ensure_blank_line(&mut self) {
+        while self.output.ends_with([' ', '\t']) {
+            self.output.pop();
+        }
+        if self.output.is_empty() {
+            return;
+        }
+        let newlines = self
+            .output
+            .chars()
+            .rev()
+            .take_while(|character| *character == '\n')
+            .count();
+        for _ in newlines..2 {
+            self.output.push('\n');
+        }
+    }
+
+    fn at_line_start(&self) -> bool {
+        self.output.is_empty() || self.output.ends_with('\n')
+    }
+
+    fn finish(self) -> String {
+        normalize_rendered_lines(&self.output)
+    }
+}
+
+fn normalize_rendered_lines(value: &str) -> String {
+    let mut lines = Vec::new();
+    let mut previous_blank = true;
+    for line in value.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if !previous_blank {
+                lines.push(String::new());
+            }
+            previous_blank = true;
+        } else {
+            lines.push(line.to_string());
+            previous_blank = false;
+        }
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn sanitize_visible_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            (!character.is_control() || matches!(character, '\n' | '\t'))
+                && !is_direction_control(*character)
+        })
+        .collect()
+}
+
 fn clean_description(value: &str) -> String {
-    let without_html = HTML_RE.replace_all(value, " ");
+    let without_html = HTML_TAG_RE.replace_all(value, " ");
     let decoded = html_escape::decode_html_entities(&without_html);
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -276,10 +504,6 @@ fn full_page_url(issue: &Issue) -> &str {
     } else {
         &issue.page_url
     }
-}
-
-fn is_http_url(value: &str) -> bool {
-    is_safe_http_url(value)
 }
 
 fn is_safe_http_url(value: &str) -> bool {
@@ -341,15 +565,18 @@ fn is_blocked_ipv4(ip: std::net::Ipv4Addr) -> bool {
 }
 
 fn is_disallowed_url_char(value: char) -> bool {
-    value.is_control()
-        || matches!(
-            value,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
+    value.is_control() || is_direction_control(value)
+}
+
+fn is_direction_control(value: char) -> bool {
+    matches!(
+        value,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn truncate_at_line(value: &str, max_chars: usize) -> String {
@@ -409,6 +636,23 @@ mod tests {
 ### [OpenRouter 大幅折扣](https://openrouter.ai/model) `#1`
 > 摘要
 "#;
+
+    #[test]
+    fn fixture_snapshots_match_onebot_and_official_outputs() {
+        let source = include_str!("../fixtures/markdown/juya-structure.md");
+        let content = prepare(&issue(), Some(source));
+        let expected_onebot = include_str!("../fixtures/expected/onebot.txt")
+            .replace("\r\n", "\n")
+            .trim_end()
+            .to_string();
+        let expected_official = include_str!("../fixtures/expected/qq-official.md")
+            .replace("\r\n", "\n")
+            .trim_end()
+            .to_string();
+
+        assert_eq!(content.onebot_text, expected_onebot);
+        assert_eq!(content.qq_markdown, expected_official);
+    }
 
     #[test]
     fn renders_onebot_overview_without_markdown_noise() {
