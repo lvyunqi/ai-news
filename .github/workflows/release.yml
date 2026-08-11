@@ -134,7 +134,7 @@ jobs:
         shell: bash
         working-directory: release-assets
         run: sha256sum --check *.sha256
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             release-assets/*.dll
