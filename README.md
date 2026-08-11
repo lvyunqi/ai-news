@@ -19,6 +19,7 @@ QimenBot API 0.6 动态插件，轮询[橘鸦 AI 早报](https://daily.juya.uk/r
 
 | 项目 | 版本 |
 | --- | --- |
+| AI News 插件 | `0.1.0` |
 | QimenBot | `v0.1.18` 或更高 |
 | 动态 ABI | `0.6` |
 | `abi-stable-host-api` | `0.1.13` |
@@ -136,7 +137,7 @@ cargo build --locked --release
 
 主分支 CI 会显式构建表中的三个 target。Windows 记录大小和 SHA256；Linux 在 Debian 11 容器中额外运行 `file`、`ldd`、`readelf --version-info` 并记录实际 `min_glibc`。这些结果只作为 14 天的 CI 证据，不创建 Release，也不代表已经通过 QimenBot 宿主加载验收。
 
-## 候选版本发布
+## 版本发布
 
 推送与 `Cargo.toml` 版本一致的 `v*` tag 会触发 Release 工作流。工作流先执行格式、Clippy 和全部测试，再构建以下固定资产：
 
@@ -144,7 +145,7 @@ cargo build --locked --release
 - `libqimen_dynamic_plugin_ai_news-x86_64-unknown-linux-gnu.so`
 - `libqimen_dynamic_plugin_ai_news-aarch64-unknown-linux-gnu.so`
 
-每个动态库同时生成 `.sha256` 和 `.json` 元数据。Linux 在 Debian 11 容器中原生构建，并把 `file`、`ldd`、`readelf --version-info` 结果及实际最高 GLIBC 符号版本写入发布资产。发布前必须先完成目标 QimenBot 宿主加载和真实机器人能力确认；工作流配置完成不等于协议已经验收。
+每个动态库同时生成 `.sha256` 和 `.json` 元数据。Linux 在 Debian 11 容器中原生构建，并把 `file`、`ldd`、`readelf --version-info` 结果及实际最高 GLIBC 符号版本写入发布资产。工作流配置完成不等于协议已经验收；`v0.1.0` 由维护者在实际部署环境确认加载、配置和主动推送正常后发布，未记录的操作系统、客户端和机器人权限组合仍需部署者自行验证。
 
 ## 依赖策略
 
