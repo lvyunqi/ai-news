@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,9 +16,58 @@ use crate::render::prepare;
 use crate::state::DeliveryState;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static MANUAL_TRIGGER: AtomicU8 = AtomicU8::new(TRIGGER_NONE);
 static WORKER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 static STATUS: LazyLock<RwLock<StatusSnapshot>> =
     LazyLock::new(|| RwLock::new(StatusSnapshot::default()));
+
+const TRIGGER_NONE: u8 = 0;
+const TRIGGER_MANUAL: u8 = 1;
+const TRIGGER_FORCE: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PollTrigger {
+    Scheduled,
+    Manual,
+    ManualForce,
+}
+
+impl PollTrigger {
+    fn from_pending(value: u8) -> Self {
+        match value {
+            TRIGGER_FORCE => Self::ManualForce,
+            TRIGGER_MANUAL => Self::Manual,
+            _ => Self::Scheduled,
+        }
+    }
+
+    fn force(self) -> bool {
+        self == Self::ManualForce
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Manual => "manual",
+            Self::ManualForce => "manual-force",
+        }
+    }
+
+    fn status_prefix(self) -> &'static str {
+        match self {
+            Self::Scheduled => "",
+            Self::Manual => "手动推送：",
+            Self::ManualForce => "手动强制推送：",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PollContext<'a> {
+    now: DateTime<Utc>,
+    stop: &'a AtomicBool,
+    trigger: PollTrigger,
+}
 
 #[derive(Clone, Debug)]
 pub struct StatusSnapshot {
@@ -61,8 +110,9 @@ pub struct TargetResult {
     pub at: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct PollResult {
+    trigger: PollTrigger,
     issue_date: Option<String>,
     issue_id: Option<String>,
     accepted: usize,
@@ -70,6 +120,21 @@ struct PollResult {
     failed: usize,
     targets: Vec<TargetResult>,
     message: String,
+}
+
+impl Default for PollResult {
+    fn default() -> Self {
+        Self {
+            trigger: PollTrigger::Scheduled,
+            issue_date: None,
+            issue_id: None,
+            accepted: 0,
+            skipped: 0,
+            failed: 0,
+            targets: Vec::new(),
+            message: String::new(),
+        }
+    }
 }
 
 pub fn start(config: RuntimeConfig, data_dir: PathBuf) -> Result<(), String> {
@@ -118,6 +183,7 @@ pub fn start(config: RuntimeConfig, data_dir: PathBuf) -> Result<(), String> {
     };
 
     STOP.store(false, Ordering::Release);
+    MANUAL_TRIGGER.store(TRIGGER_NONE, Ordering::Release);
     let mut slot = WORKER.lock().map_err(|_| "后台线程锁已损坏".to_string())?;
     let handle = thread::Builder::new()
         .name("qimen-ai-news".to_string())
@@ -130,6 +196,7 @@ pub fn start(config: RuntimeConfig, data_dir: PathBuf) -> Result<(), String> {
 
 pub fn stop() -> Result<(), String> {
     STOP.store(true, Ordering::Release);
+    MANUAL_TRIGGER.store(TRIGGER_NONE, Ordering::Release);
     let handle = WORKER
         .lock()
         .map_err(|_| "后台线程锁已损坏".to_string())?
@@ -144,6 +211,68 @@ pub fn stop() -> Result<(), String> {
     Ok(())
 }
 
+pub fn request_push(force: bool) -> Result<String, String> {
+    let snapshot = STATUS
+        .read()
+        .map_err(|_| "状态锁已损坏".to_string())?
+        .clone();
+    if !snapshot.plugin_enabled {
+        return Err("插件配置为关闭，不能手动推送".to_string());
+    }
+    if snapshot.enabled_targets == 0 {
+        return Err("没有启用的推送目标".to_string());
+    }
+    if snapshot.worker_state == "protected" {
+        return Err("插件处于状态保护模式，请先修复状态文件问题".to_string());
+    }
+    if snapshot.worker_state != "running" {
+        return Err("后台 Worker 未运行，不能手动推送".to_string());
+    }
+
+    let worker_thread = {
+        let slot = WORKER.lock().map_err(|_| "后台线程锁已损坏".to_string())?;
+        if STOP.load(Ordering::Acquire) {
+            return Err("插件正在停止，请稍后重试".to_string());
+        }
+        slot.as_ref()
+            .map(|handle| handle.thread().clone())
+            .ok_or_else(|| "后台 Worker 未运行，不能手动推送".to_string())?
+    };
+
+    let requested = if force { TRIGGER_FORCE } else { TRIGGER_MANUAL };
+    let previous = queue_manual_trigger(requested);
+    worker_thread.unpark();
+
+    let message = match (force, previous) {
+        (false, TRIGGER_NONE) => "已请求立即推送最新一期；结果稍后可用 /ainews status 查看",
+        (false, TRIGGER_MANUAL) => "已有立即推送请求等待执行；结果稍后可用 /ainews status 查看",
+        (false, TRIGGER_FORCE) => "已有强制推送请求等待执行；结果稍后可用 /ainews status 查看",
+        (true, TRIGGER_NONE) => "已请求强制推送最新一期；该操作可能产生重复消息",
+        (true, TRIGGER_MANUAL) => "已将等待中的立即推送升级为强制推送；该操作可能产生重复消息",
+        (true, TRIGGER_FORCE) => "已有强制推送请求等待执行；该操作可能产生重复消息",
+        _ => "已请求立即推送最新一期",
+    };
+    Ok(message.to_string())
+}
+
+fn queue_manual_trigger(requested: u8) -> u8 {
+    let mut current = MANUAL_TRIGGER.load(Ordering::Acquire);
+    loop {
+        if current >= requested {
+            return current;
+        }
+        match MANUAL_TRIGGER.compare_exchange(
+            current,
+            requested,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(previous) => return previous,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn worker_loop(
     config: RuntimeConfig,
     data_dir: PathBuf,
@@ -152,15 +281,31 @@ fn worker_loop(
     sender: impl DeliverySender,
 ) {
     while !STOP.load(Ordering::Acquire) {
+        let trigger =
+            PollTrigger::from_pending(MANUAL_TRIGGER.swap(TRIGGER_NONE, Ordering::AcqRel));
         let now = Utc::now();
         let started = Instant::now();
-        let result = run_poll(&config, &data_dir, &source, &sender, &mut state, now, &STOP);
+        let result = run_poll_with_trigger(
+            &config,
+            &data_dir,
+            &source,
+            &sender,
+            &mut state,
+            PollContext {
+                now,
+                stop: &STOP,
+                trigger,
+            },
+        );
         let elapsed = started.elapsed();
         match result {
             Ok(result) => apply_poll_result(result, now, elapsed),
             Err(error) => {
-                eprintln!("[ai-news][poll] level=warn {error}");
-                apply_poll_error(error.clone(), now, elapsed);
+                eprintln!(
+                    "[ai-news][poll] level=warn trigger={} {error}",
+                    trigger.label()
+                );
+                apply_poll_error(error.clone(), now, elapsed, trigger);
                 if error.starts_with("状态写入失败") {
                     update_status(|status| status.worker_state = "protected".to_string());
                     break;
@@ -179,6 +324,7 @@ fn worker_loop(
     });
 }
 
+#[cfg(test)]
 fn run_poll(
     config: &RuntimeConfig,
     data_dir: &Path,
@@ -188,12 +334,36 @@ fn run_poll(
     now: DateTime<Utc>,
     stop: &AtomicBool,
 ) -> Result<PollResult, String> {
+    run_poll_with_trigger(
+        config,
+        data_dir,
+        source,
+        sender,
+        state,
+        PollContext {
+            now,
+            stop,
+            trigger: PollTrigger::Scheduled,
+        },
+    )
+}
+
+fn run_poll_with_trigger(
+    config: &RuntimeConfig,
+    data_dir: &Path,
+    source: &dyn ContentSource,
+    sender: &dyn DeliverySender,
+    state: &mut DeliveryState,
+    context: PollContext<'_>,
+) -> Result<PollResult, String> {
+    let PollContext { now, stop, trigger } = context;
     let rss = source
         .fetch_rss(&config.feed_url)
         .map_err(|error| format!("RSS 获取失败：{error}"))?;
     let today = now.with_timezone(&config.timezone).date_naive();
     let Some(issue) = parse_latest_today(&rss, today, config.timezone, &config.feed_url)? else {
         return Ok(PollResult {
+            trigger,
             message: format!("{} 没有新的当天早报", today.format("%Y-%m-%d")),
             ..PollResult::default()
         });
@@ -202,10 +372,13 @@ fn run_poll(
     let pending = config
         .targets
         .iter()
-        .filter(|target| target.enabled && !state.contains(&target.key(), &issue.id))
+        .filter(|target| {
+            target.enabled && (trigger.force() || !state.contains(&target.key(), &issue.id))
+        })
         .count();
     if pending == 0 {
         return Ok(PollResult {
+            trigger,
             issue_date: Some(issue.date.to_string()),
             issue_id: Some(issue.id.clone()),
             skipped: config
@@ -231,6 +404,7 @@ fn run_poll(
     let content = prepare(&issue, markdown.as_deref());
     let mut cover_cache: Option<Result<String, String>> = None;
     let mut result = PollResult {
+        trigger,
         issue_date: Some(issue.date.to_string()),
         issue_id: Some(issue.id.clone()),
         message: String::new(),
@@ -242,7 +416,7 @@ fn run_poll(
             break;
         }
         let key = target.key();
-        if state.contains(&key, &issue.id) {
+        if !trigger.force() && state.contains(&key, &issue.id) {
             result.skipped += 1;
             result.targets.push(target_result(target, "Skipped", now));
             continue;
@@ -305,18 +479,18 @@ fn apply_poll_result(result: PollResult, now: DateTime<Utc>, elapsed: Duration) 
     update_status(|status| {
         status.last_poll_at = Some(now.to_rfc3339());
         status.last_poll_duration_ms = Some(elapsed.as_millis());
-        status.last_result = result.message;
+        status.last_result = format!("{}{}", result.trigger.status_prefix(), result.message);
         status.last_issue_date = result.issue_date;
         status.last_issue_hash = result.issue_id.as_deref().map(issue_hash_prefix);
         status.target_results = result.targets;
     });
 }
 
-fn apply_poll_error(error: String, now: DateTime<Utc>, elapsed: Duration) {
+fn apply_poll_error(error: String, now: DateTime<Utc>, elapsed: Duration, trigger: PollTrigger) {
     update_status(|status| {
         status.last_poll_at = Some(now.to_rfc3339());
         status.last_poll_duration_ms = Some(elapsed.as_millis());
-        status.last_result = error;
+        status.last_result = format!("{}{}", trigger.status_prefix(), error);
     });
 }
 
@@ -375,12 +549,22 @@ fn enqueue_log_line(
 }
 
 fn poll_log_line(result: &PollResult, elapsed: Duration) -> String {
-    format!(
-        "[ai-news][poll] level=info {} duration_ms={} targets={}",
-        result.message,
-        elapsed.as_millis(),
-        result.targets.len()
-    )
+    if result.trigger == PollTrigger::Scheduled {
+        format!(
+            "[ai-news][poll] level=info {} duration_ms={} targets={}",
+            result.message,
+            elapsed.as_millis(),
+            result.targets.len()
+        )
+    } else {
+        format!(
+            "[ai-news][poll] level=info trigger={} {} duration_ms={} targets={}",
+            result.trigger.label(),
+            result.message,
+            elapsed.as_millis(),
+            result.targets.len()
+        )
+    }
 }
 
 fn target_result(target: &crate::config::Target, status: &str, at: DateTime<Utc>) -> TargetResult {
@@ -685,6 +869,7 @@ mod tests {
             .filter(|target| target.enabled)
             .count();
         STOP.store(false, Ordering::Release);
+        MANUAL_TRIGGER.store(TRIGGER_NONE, Ordering::Release);
         let handle = thread::Builder::new()
             .name("qimen-ai-news-test".to_string())
             .spawn(move || worker_loop(config, data_dir, source, state, sender))
@@ -1505,7 +1690,12 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap_err();
-        apply_poll_error(error, now, Duration::from_millis(11));
+        apply_poll_error(
+            error,
+            now,
+            Duration::from_millis(11),
+            PollTrigger::Scheduled,
+        );
         let failure_output = status_text();
 
         assert!(no_content_output.contains("没有新的当天早报"));
@@ -1521,6 +1711,7 @@ mod tests {
         let queue_target = target("official", Protocol::QqOfficial, "987654321", "ihgfedcba");
         let now = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
         let result = PollResult {
+            trigger: PollTrigger::Scheduled,
             issue_date: Some("2026-08-10".to_string()),
             issue_id: Some("issue-with-secret-query".to_string()),
             accepted: 1,
@@ -1660,6 +1851,93 @@ mod tests {
         );
         assert!(!state_path(root.path()).exists());
         stop().unwrap();
+    }
+
+    #[test]
+    fn manual_push_wakes_worker_and_force_resends_latest_issue() {
+        let _guard = test_guard();
+        let root = tempfile::tempdir().unwrap();
+        let source = FakeSource {
+            rss_body: Some(rss_for_current_day("manual-push")),
+            ..FakeSource::default()
+        };
+        let observed_source = source.clone();
+        let sender = FakeSender::accepted();
+        let observed_sender = sender.clone();
+        let mut config = config();
+        config.poll_interval = Duration::from_secs(3600);
+        install_test_worker(config, root.path().to_path_buf(), source, sender);
+        wait_until("initial scheduled send", || {
+            observed_sender.calls.lock().unwrap().len() == 1
+        });
+
+        let normal = request_push(false).unwrap();
+        assert!(normal.contains("已请求立即推送"));
+        wait_until("manual deduplicated poll", || {
+            observed_source.rss_calls.load(Ordering::Relaxed) >= 2
+                && status_text().contains("手动推送：")
+        });
+        assert_eq!(observed_sender.calls.lock().unwrap().len(), 1);
+
+        let forced = request_push(true).unwrap();
+        assert!(forced.contains("已请求强制推送"));
+        wait_until("forced manual resend", || {
+            observed_sender.calls.lock().unwrap().len() == 2
+                && status_text().contains("手动强制推送：")
+        });
+        assert!(observed_source.rss_calls.load(Ordering::Relaxed) >= 3);
+        assert!(
+            DeliveryState::load(root.path())
+                .unwrap()
+                .contains("onebot11|bot|group", "manual-push")
+        );
+        stop().unwrap();
+    }
+
+    #[test]
+    fn manual_trigger_requests_coalesce_and_force_takes_precedence() {
+        let _guard = test_guard();
+        MANUAL_TRIGGER.store(TRIGGER_NONE, Ordering::Release);
+
+        assert_eq!(queue_manual_trigger(TRIGGER_MANUAL), TRIGGER_NONE);
+        assert_eq!(queue_manual_trigger(TRIGGER_MANUAL), TRIGGER_MANUAL);
+        assert_eq!(queue_manual_trigger(TRIGGER_FORCE), TRIGGER_MANUAL);
+        assert_eq!(queue_manual_trigger(TRIGGER_MANUAL), TRIGGER_FORCE);
+        assert_eq!(MANUAL_TRIGGER.load(Ordering::Acquire), TRIGGER_FORCE);
+
+        MANUAL_TRIGGER.store(TRIGGER_NONE, Ordering::Release);
+    }
+
+    #[test]
+    fn manual_push_rejects_disabled_empty_stopped_and_protected_states() {
+        let _guard = test_guard();
+        stop().unwrap();
+
+        replace_status(StatusSnapshot::default());
+        assert!(request_push(false).unwrap_err().contains("配置为关闭"));
+
+        replace_status(StatusSnapshot {
+            plugin_enabled: true,
+            enabled_targets: 0,
+            ..StatusSnapshot::default()
+        });
+        assert!(request_push(false).unwrap_err().contains("没有启用"));
+
+        replace_status(StatusSnapshot {
+            plugin_enabled: true,
+            enabled_targets: 1,
+            worker_state: "stopped".to_string(),
+            ..StatusSnapshot::default()
+        });
+        assert!(request_push(false).unwrap_err().contains("未运行"));
+
+        replace_status(StatusSnapshot {
+            plugin_enabled: true,
+            enabled_targets: 1,
+            worker_state: "protected".to_string(),
+            ..StatusSnapshot::default()
+        });
+        assert!(request_push(true).unwrap_err().contains("保护模式"));
     }
 
     #[test]

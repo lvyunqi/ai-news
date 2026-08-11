@@ -16,9 +16,31 @@ use abi_stable_host_api::{
 };
 use qimen_dynamic_plugin_derive::dynamic_plugin;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminCommand {
+    Status,
+    Push { force: bool },
+    Usage,
+}
+
+fn parse_admin_command(args: &str) -> AdminCommand {
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [] => AdminCommand::Status,
+        [command] if command.eq_ignore_ascii_case("status") => AdminCommand::Status,
+        [command] if command.eq_ignore_ascii_case("push") => AdminCommand::Push { force: false },
+        [command, flag]
+            if command.eq_ignore_ascii_case("push") && flag.eq_ignore_ascii_case("--force") =>
+        {
+            AdminCommand::Push { force: true }
+        }
+        _ => AdminCommand::Usage,
+    }
+}
+
 #[dynamic_plugin(
     id = "ai-news",
-    version = "0.1.0-rc.1",
+    version = "0.1.0-rc.2",
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
@@ -58,17 +80,49 @@ mod plugin {
 
     #[command(
         name = "ainews",
-        description = "查看 AI 早报主动推送状态",
+        description = "查看状态或立即推送最新一期 AI 早报",
         category = "tools",
         role = "admin",
         scope = "all"
     )]
-    fn status(request: &CommandRequest) -> CommandResponse {
-        let args = request.args.as_str().trim();
-        if args.is_empty() || args.eq_ignore_ascii_case("status") {
-            CommandResponse::text(&runtime::status_text())
-        } else {
-            CommandResponse::text("用法：ainews status")
+    fn command(request: &CommandRequest) -> CommandResponse {
+        match parse_admin_command(request.args.as_str()) {
+            AdminCommand::Status => CommandResponse::text(&runtime::status_text()),
+            AdminCommand::Push { force } => command_result(runtime::request_push(force)),
+            AdminCommand::Usage => {
+                CommandResponse::text("用法：ainews status | ainews push [--force]")
+            }
         }
+    }
+
+    fn command_result(result: Result<String, String>) -> CommandResponse {
+        match result {
+            Ok(message) => CommandResponse::text(&message),
+            Err(error) => CommandResponse::text(&format!("无法执行：{error}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_status_and_manual_push_commands() {
+        assert_eq!(parse_admin_command(""), AdminCommand::Status);
+        assert_eq!(parse_admin_command("STATUS"), AdminCommand::Status);
+        assert_eq!(
+            parse_admin_command("push"),
+            AdminCommand::Push { force: false }
+        );
+        assert_eq!(
+            parse_admin_command("  PUSH   --FORCE  "),
+            AdminCommand::Push { force: true }
+        );
+        assert_eq!(parse_admin_command("push now"), AdminCommand::Usage);
+        assert_eq!(
+            parse_admin_command("push --force extra"),
+            AdminCommand::Usage
+        );
     }
 }
