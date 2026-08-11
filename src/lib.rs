@@ -18,7 +18,7 @@ use qimen_dynamic_plugin_derive::dynamic_plugin;
 
 #[dynamic_plugin(
     id = "ai-news",
-    version = "0.1.0",
+    version = "0.1.0-rc.1",
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
