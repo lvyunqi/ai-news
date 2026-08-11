@@ -1,19 +1,19 @@
 === disabled ===
-AI 早报插件 v0.1.0-rc.1（动态 API 0.6 / 配置 v1）
+AI 早报插件 v0.1.0-rc.2（动态 API 0.6 / 配置 v1）
 配置：关闭，Worker：stopped
 目标：启用 0/配置 0
 最近轮询：尚未轮询
 最近结果：插件配置为关闭
 
 === no-targets ===
-AI 早报插件 v0.1.0-rc.1（动态 API 0.6 / 配置 v1）
+AI 早报插件 v0.1.0-rc.2（动态 API 0.6 / 配置 v1）
 配置：启用，Worker：stopped
 目标：启用 0/配置 2
 最近轮询：尚未轮询
 最近结果：没有启用的推送目标
 
 === no-content ===
-AI 早报插件 v0.1.0-rc.1（动态 API 0.6 / 配置 v1）
+AI 早报插件 v0.1.0-rc.2（动态 API 0.6 / 配置 v1）
 配置：启用，Worker：running
 目标：启用 2/配置 2
 最近轮询：2026-08-11T00:00:00+00:00
@@ -21,7 +21,7 @@ AI 早报插件 v0.1.0-rc.1（动态 API 0.6 / 配置 v1）
 轮询耗时：7 ms
 
 === partial-failure ===
-AI 早报插件 v0.1.0-rc.1（动态 API 0.6 / 配置 v1）
+AI 早报插件 v0.1.0-rc.2（动态 API 0.6 / 配置 v1）
 配置：启用，Worker：running
 目标：启用 2/配置 2
 最近轮询：2026-08-11T00:01:00+00:00
@@ -32,7 +32,7 @@ AI 早报插件 v0.1.0-rc.1（动态 API 0.6 / 配置 v1）
 - official [qq-official] 987***321/ope***nid：QueueFull（2026-08-11T00:01:00+00:00）
 
 === protected ===
-AI 早报插件 v0.1.0-rc.1（动态 API 0.6 / 配置 v1）
+AI 早报插件 v0.1.0-rc.2（动态 API 0.6 / 配置 v1）
 配置：启用，Worker：protected
 目标：启用 1/配置 1
 最近轮询：尚未轮询
